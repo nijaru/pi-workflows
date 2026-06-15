@@ -1,0 +1,36 @@
+{
+  "name": "pi-workflows",
+  "version": "0.1.0",
+  "type": "module",
+  "description": "Script-as-plan orchestration for pi — model writes JS, runtime executes.",
+  "keywords": [
+    "pi-package",
+    "pi",
+    "pi-extension",
+    "workflows",
+    "orchestration",
+    "parallel",
+    "script-as-plan"
+  ],
+  "license": "MIT",
+  "author": "Nick Naru <nick@nijaru.com>",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/nijaru/pi-workflows.git"
+  },
+  "pi": {
+    "extensions": [
+      "./extensions"
+    ],
+    "skills": [
+      "./skills"
+    ]
+  },
+  "scripts": {
+    "test": "bun test"
+  },
+  "devDependencies": {
+    "@types/bun": "latest",
+    "typescript": "^5.0.0"
+  }
+}
