@@ -7,3 +7,4 @@ ai/
 *.log
 CLAUDE.md
 review.md
+.tasks/
