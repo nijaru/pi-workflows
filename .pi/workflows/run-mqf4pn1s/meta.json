@@ -1,0 +1,1 @@
+{"name":"resume-test-2","description":"test resume","script":"export const meta = { name: 'resume-test-2', description: 'test resume' };\nconst a = await agent('Say hello', { label: 'step1' });\nlog('Step 1: ' + a);\nconst b = await agent('Say world', { label: 'step2' });\nlog('Step 2: ' + b);"}

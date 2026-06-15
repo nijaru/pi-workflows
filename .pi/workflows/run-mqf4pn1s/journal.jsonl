@@ -1,0 +1,2 @@
+{"index":0,"hash":"5eab1bdbdac01a13a2aec35b7b1c22f2d824928046fc1b658430791743906426","result":"Hello! How can I help you today?","tokens":{"input":56,"output":23,"total":30671,"cost":0.0001545012},"durationMs":3801}
+{"index":1,"hash":"ec340ebdd9e84f2d3396cd93381543440fdfd5ca6c18db3085a3ef0b645cda8d","result":"world","tokens":{"input":56,"output":16,"total":30664,"cost":0.0001484112},"durationMs":3133}
