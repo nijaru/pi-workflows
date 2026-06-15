@@ -235,7 +235,7 @@ function parseScript(script: string): { meta: WorkflowMeta; body: string } {
   const afterMeta = script[metaEnd] === ';' ? metaEnd + 1 : metaEnd;
 
   let meta: WorkflowMeta;
-  try { meta = eval(`(${metaStr})`); } catch { throw new Error("meta must be a literal object"); }
+  try { meta = new Function(`return (${metaStr})`)(); } catch { throw new Error("meta must be a literal object"); }
   if (!meta?.name?.trim()) throw new Error("meta.name must be a non-empty string");
   if (!meta?.description?.trim()) throw new Error("meta.description must be a non-empty string");
 
@@ -734,27 +734,38 @@ function createWorkflowTool() {
 
     parameters: WorkflowParams,
 
-    renderCall(args: { script: string; background?: boolean }, theme: Theme, _context?: { lastComponent?: Component; invalidate?: () => void }) {
+    renderCall(args: { script: string; background?: boolean }, theme: Theme, context?: { lastComponent?: Component; invalidate?: () => void; args?: unknown; state?: Record<string, unknown>; toolCallId?: string; cwd?: string; executionStarted?: boolean; argsComplete?: boolean; isPartial?: boolean; expanded?: boolean; showImages?: boolean; isError?: boolean }) {
+      const existing = context?.lastComponent as Text | undefined;
       const meta = parseScriptSafe(args.script);
       const label = meta?.name ?? "workflow";
-      return new Text(
+      const content =
         theme.fg("toolTitle", theme.bold("workflow ")) +
         theme.fg("accent", label.slice(0, 40)) +
-        (args.background !== false ? theme.fg("dim", " (background)") : theme.fg("dim", " (blocking)")),
-        0, 0
-      );
+        (args.background !== false ? theme.fg("dim", " (background)") : theme.fg("dim", " (blocking)"));
+      if (existing) { existing.setText(content); return existing; }
+      return new Text(content, 0, 0);
     },
 
-    renderResult(r: { content: Array<{ type: string; text?: string }>; details?: unknown }, _: unknown, theme: Theme, context?: { isError?: boolean; lastComponent?: Component }) {
+    renderResult(
+      r: { content: Array<{ type: string; text?: string }>; details?: unknown },
+      opts: { expanded?: boolean; isPartial?: boolean },
+      theme: Theme,
+      context?: { isError?: boolean; lastComponent?: Component; invalidate?: () => void; args?: unknown; state?: Record<string, unknown>; toolCallId?: string; cwd?: string; executionStarted?: boolean; argsComplete?: boolean; isPartial?: boolean; expanded?: boolean; showImages?: boolean },
+    ) {
       const text = r.content[0]?.type === "text" ? (r.content[0] as { text?: string }).text ?? "" : "";
       const details = r.details as Record<string, unknown> | undefined;
+
+      if (opts.isPartial) {
+        return new Text(theme.fg("warning", "⏳ ") + theme.fg("text", text || "Working..."), 0, 0);
+      }
+
       const prefix = context?.isError ? theme.fg("error", "✗ ") : theme.fg("success", "✓ ");
       if (details?.background && !context?.isError) {
-        return new Text(
-          theme.fg("success", "▶ ") + theme.fg("text", text) +
-          theme.fg("dim", ` [run: ${details.runId}]`),
-          0, 0
-        );
+        let out = theme.fg("success", "▶ ") + theme.fg("text", text) + theme.fg("dim", ` [run: ${details.runId}]`);
+        if (opts.expanded && details.resumed) {
+          out += theme.fg("dim", " (resumed)");
+        }
+        return new Text(out, 0, 0);
       }
       return new Text(prefix + theme.fg("text", text), 0, 0);
     },
@@ -792,7 +803,7 @@ function createWorkflowTool() {
       }
       
       if (!runId) {
-        runId = `run-${Date.now().toString(36)}`;
+        runId = `run-${Date.now().toString(36)}`; // monotonic counter not needed — runId is persistence-only, not execution context
       }
 
       // Write meta file for resume detection
