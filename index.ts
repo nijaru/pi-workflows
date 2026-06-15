@@ -409,10 +409,21 @@ async function executeWorkflow(
     if (options.signal?.aborted) throw new Error("Workflow aborted");
   };
 
+  const throwIfPaused = () => {
+    try {
+      if (existsSync(join(cwd, WORKFLOW_DIR, runId, "paused"))) {
+        throw new Error("Workflow paused");
+      }
+    } catch (e) {
+      if (e instanceof Error && e.message === "Workflow paused") throw e;
+    }
+  };
+
   // ── agent() — the core primitive ──────────────────────────────────
 
   const agent = async (prompt: string, opts: AgentOptions = {}): Promise<string | null> => {
     throwIfAborted();
+    throwIfPaused();
     if (shared.agentCount >= maxAgents) throw new Error(`Agent limit exceeded (${maxAgents})`);
     if (budget.total !== null && budget.remaining() <= 0) throw new Error("Token budget exhausted");
 
@@ -709,6 +720,9 @@ const WorkflowParams = Type.Object({
   forceResume: Type.Optional(Type.Boolean({
     description: "Allow resuming a run that previously errored (default: false).",
   })),
+  dryRun: Type.Optional(Type.Boolean({
+    description: "Parse and validate the script without executing. Returns metadata only.",
+  })),
 });
 
 function createWorkflowTool() {
@@ -763,12 +777,24 @@ function createWorkflowTool() {
       return new Text(prefix + theme.fg("text", text), 0, 0);
     },
 
-    async execute(_id: string, params: { script: string; args?: unknown; background?: boolean; tokenBudget?: number; maxAgents?: number; resume?: boolean; forceResume?: boolean }, signal?: AbortSignal, _onUpdate?: unknown, ctx?: ExtensionContext) {
+    async execute(_id: string, params: { script: string; args?: unknown; background?: boolean; tokenBudget?: number; maxAgents?: number; resume?: boolean; forceResume?: boolean; dryRun?: boolean }, signal?: AbortSignal, _onUpdate?: unknown, ctx?: ExtensionContext) {
       let script = params.script.trim();
       const fence = script.match(/^```(?:js|javascript)?\s*\n([\s\S]*?)\n```$/i);
       if (fence?.[1]) script = fence[1].trim();
 
       const { meta } = parseScript(script);
+
+      // Dry run: return metadata without executing
+      if (params.dryRun) {
+        return ok(
+          `Workflow "${meta.name}": ${meta.description}${meta.phases ? `, ${meta.phases.length} phase(s)` : ""}. ` +
+          `Script is valid and ready to run.` +
+          (params.tokenBudget ? ` Budget: ${params.tokenBudget} tokens.` : "") +
+          (params.maxAgents ? ` Max agents: ${params.maxAgents}.` : ""),
+          { dryRun: true, meta, scriptLength: script.length },
+        );
+      }
+
       const cwd = process.cwd();
       const shouldResume = params.resume !== false; // default true
       
@@ -823,15 +849,19 @@ function createWorkflowTool() {
           } catch {}
         }).catch((err) => {
           const error = err instanceof Error ? err.message : String(err);
+          const isPaused = error === "Workflow paused";
           const dir = join(cwd, WORKFLOW_DIR, runId!);
           try {
             mkdirSync(dir, { recursive: true });
-            writeFileSync(join(dir, "error.log"), `[${new Date().toISOString()}] ${error}\n`);
+            if (isPaused) {
+              // Journal is preserved on disk — resume with same runId
+              if (ctx) ctx.ui.notify(`Workflow "${meta.name}" paused. Resume by running again (runId: ${runId}).`, "info");
+            } else {
+              writeFileSync(join(dir, "error.log"), `[${new Date().toISOString()}] ${error}\n`);
+              console.error(`[pi-workflows] Background workflow ${runId} failed: ${error}`);
+              if (ctx) ctx.ui.notify(`Workflow "${meta.name}" failed: ${error}`, "error");
+            }
           } catch {}
-          console.error(`[pi-workflows] Background workflow ${runId} failed: ${error}`);
-          if (ctx) {
-            ctx.ui.notify(`Workflow "${meta.name}" failed: ${error}`, "error");
-          }
         });
 
         const resumedMsg = resumeJournal ? ` (resumed from ${resumeJournal.size} cached)` : "";
@@ -908,6 +938,7 @@ function listWorkflowRuns(cwd: string): Array<{ runId: string; meta: WorkflowMet
       const completePath = join(dir, entry, "complete.log");
       const hasError = existsSync(errorPath);
       const hasComplete = existsSync(completePath);
+      const hasPaused = existsSync(join(dir, entry, "paused"));
       const hasMeta = existsSync(metaPath);
       
       // Read meta from meta.json
@@ -922,7 +953,7 @@ function listWorkflowRuns(cwd: string): Array<{ runId: string; meta: WorkflowMet
       runs.push({
         runId: entry,
         meta,
-        status: hasError ? "error" : hasComplete ? "completed" : "running",
+        status: hasError ? "error" : hasComplete ? "completed" : hasPaused ? "paused" : "running",
       });
     }
   } catch {}
@@ -961,7 +992,7 @@ export default function registerExtension(pi: ExtensionAPI) {
           parts.push("Recent runs:");
           for (const r of runs.slice(-10)) {
             const name = r.meta?.name ?? r.runId;
-            const status = r.status === "error" ? " ❌" : r.status === "completed" ? " ✓" : " ⏳";
+            const status = r.status === "error" ? " ❌" : r.status === "completed" ? " ✓" : r.status === "paused" ? " ⏸" : " ⏳";
             parts.push(`  ${name}${status}`);
           }
         } else {
@@ -999,11 +1030,34 @@ export default function registerExtension(pi: ExtensionAPI) {
         return;
       }
 
+      if (cmd.startsWith("pause ")) {
+        const targetRunId = cmd.slice(6).trim();
+        if (!targetRunId) {
+          ctx.ui.notify("Usage: /workflows pause <runId>", "error");
+          return;
+        }
+        const pauseFile = join(cwd, WORKFLOW_DIR, targetRunId, "paused");
+        const metaFile = join(cwd, WORKFLOW_DIR, targetRunId, "meta.json");
+        if (!existsSync(metaFile)) {
+          ctx.ui.notify(`Run ${targetRunId} not found.`, "error");
+          return;
+        }
+        try {
+          mkdirSync(join(cwd, WORKFLOW_DIR, targetRunId), { recursive: true });
+          writeFileSync(pauseFile, new Date().toISOString());
+          ctx.ui.notify(`Pause signal sent to ${targetRunId}. The run will stop at the next agent call.`, "info");
+        } catch (e) {
+          ctx.ui.notify(`Failed to write pause signal: ${e instanceof Error ? e.message : String(e)}`, "error");
+        }
+        return;
+      }
+
       ctx.ui.notify([
-        "Usage: /workflows [list|save]",
+        "Usage: /workflows [list|save|pause]",
         "",
-        "  list         List saved commands and recent runs",
-        "  save <name>  Save the last workflow as a reusable command",
+        "  list           List saved commands and recent runs",
+        "  save <name>    Save the last workflow as a reusable command",
+        "  pause <runId>  Pause a running workflow (resume with same runId)",
       ].join("\n"), "info");
     },
   });
