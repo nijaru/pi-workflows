@@ -143,11 +143,10 @@ function hashCall(prompt: string, opts: AgentOptions, phase?: string): string {
 const DETERMINISM_PRELUDE = [
   '"use strict";',
   'Math.random = () => { throw new Error("Math.random() unavailable in workflow"); };',
-  'Date.now = () => { throw new Error("Date.now() unavailable in workflow"); };',
   'const _D = Date;',
-  'const _S = function(...a) { if (!new.target) throw new Error("Date() unavailable"); if (!a.length) throw new Error("new Date() unavailable"); return Reflect.construct(_D, a, _S); };',
-  '_S.UTC = _D.UTC; _S.parse = _D.parse; _S.now = () => { throw new Error("Date.now() unavailable"); };',
-  '_S.prototype = _D.prototype; globalThis.Date = _S;',
+  'const _ND = function(...a) { if (!a.length) throw new Error("new Date() without args is non-deterministic. Use new Date(\"2024-01-01\") or Date.UTC() instead."); return Reflect.construct(_D, a, _ND); };',
+  '_ND.UTC = _D.UTC; _ND.parse = _D.parse; _ND.now = () => { throw new Error("Date.now() unavailable in workflow"); };',
+  '_ND.prototype = _D.prototype; globalThis.Date = _ND;',
 ].join("\n");
 
 // ── Journal Persistence ────────────────────────────────────────────────────
@@ -208,8 +207,8 @@ function parseScriptSafe(script: string): WorkflowMeta | null {
 }
 
 function parseScript(script: string): { meta: WorkflowMeta; body: string } {
-  if (/\bDate\.now\b|\bMath\.random\b|\bnew Date\(\)/.test(script)) {
-    throw new Error("Workflow scripts must be deterministic (no Date.now/Math.random)");
+  if (/\bDate\.now\b|\bMath\.random\b|\bnew Date\s*\(\s*\)/.test(script)) {
+    throw new Error("Workflow scripts must be deterministic (no Date.now()/Math.random()/new Date()). Explicit dates like new Date(\"2024-01-01\") are allowed.");
   }
 
   // Find the start of the meta object
@@ -659,14 +658,7 @@ ${JSON.stringify(results).slice(0, 4000)}`, { label: "completeness critic" });
     completenessCheck,
     args: options.args,
     cwd,
-    process: Object.freeze({ cwd: () => cwd }),
     budget,
-    console: {
-      log,
-      info: log,
-      warn: (m: unknown) => log(`[warn] ${String(m)}`),
-      error: (m: unknown) => log(`[error] ${String(m)}`),
-    },
   });
 
   const wrapped = `${DETERMINISM_PRELUDE}\n(async () => {\n${body}\n})()`;
@@ -729,7 +721,8 @@ function createWorkflowTool() {
       "Use workflow when the user explicitly asks for a workflow, workflows, fan-out, or multi-agent orchestration.",
       "script must start with: export const meta = { name, description, phases? }",
       "Globals: agent(prompt, opts), parallel(fns), pipeline(items, ...stages), phase(title, {budget}), log(msg), args, budget, verify(), judgePanel(), loopUntilDry(), completenessCheck()",
-      "Do not use Date.now(), Math.random(), or new Date() — scripts must be deterministic.",
+      "Scripts have no direct filesystem or shell access. All side effects go through agent() calls.",
+      "Date.now(), Math.random(), and new Date() without args are blocked. Explicit dates like new Date(\"2024-01-01\") and Date.UTC() are allowed.",
     ],
 
     parameters: WorkflowParams,

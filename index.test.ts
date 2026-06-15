@@ -32,6 +32,21 @@ export const meta = { name: "t", description: "t" };
 Math.random();
 `)).toThrow("deterministic");
     });
+
+    test("rejects new Date() without args", () => {
+      expect(() => parseScript(`
+export const meta = { name: "t", description: "t" };
+new Date();
+`)).toThrow("deterministic");
+    });
+
+    test("allows explicit dates", () => {
+      const { meta } = parseScript(`
+export const meta = { name: "t", description: "t" };
+const d = new Date("2024-01-01");
+`);
+      expect(meta.name).toBe("t");
+    });
   });
 
   describe("extension module", () => {
