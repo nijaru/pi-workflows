@@ -560,8 +560,6 @@ async function executeWorkflow(
 
   // ── Quality helpers ─────────────────────────────────────────────────
 
-  const VERIFY_SCHEMA = { type: "object", properties: { real: { type: "boolean" }, reason: { type: "string" } }, required: ["real"] };
-
   const verify = async (item: unknown, opts?: { reviewers?: number; threshold?: number }) => {
     const reviewers = Math.max(1, opts?.reviewers ?? 2);
     const threshold = opts?.threshold ?? 0.5;
@@ -865,14 +863,6 @@ function listSavedCommands(cwd: string): Array<{ name: string; path: string }> {
   return commands;
 }
 
-function saveCommand(name: string, script: string, location: "project" | "personal", cwd: string): string {
-  const dir = location === "project" ? join(cwd, COMMANDS_DIR) : join(process.env.HOME ?? "~", ".pi", "workflows", "commands");
-  mkdirSync(dir, { recursive: true });
-  const path = join(dir, `${name}.js`);
-  writeFileSync(path, script);
-  return path;
-}
-
 function listWorkflowRuns(cwd: string): Array<{ runId: string; meta: WorkflowMeta | null; status: string }> {
   const runs: Array<{ runId: string; meta: WorkflowMeta | null; status: string }> = [];
   const dir = join(cwd, WORKFLOW_DIR);
@@ -923,17 +913,6 @@ export default function registerExtension(pi: ExtensionAPI) {
       const cmd = (args ?? "").trim().toLowerCase();
       const cwd = ctx.cwd ?? process.cwd();
       
-      if (cmd === "save" || cmd.startsWith("save ")) {
-        const name = cmd.replace("save", "").trim();
-        if (!name) {
-          ctx.ui.notify("Usage: /workflows save <name> — saves the last workflow script", "info");
-          return;
-        }
-        // TODO: Need access to last workflow run to save it
-        ctx.ui.notify("Save feature requires workflow run history. Use the workflow tool with background: false first.", "info");
-        return;
-      }
-      
       if (cmd === "list" || cmd === "ls" || cmd === "") {
         const runs = listWorkflowRuns(cwd);
         const commands = listSavedCommands(cwd);
@@ -964,10 +943,9 @@ export default function registerExtension(pi: ExtensionAPI) {
       }
       
       ctx.ui.notify([
-        "Usage: /workflows [list|save <name>]",
+        "Usage: /workflows [list]",
         "",
-        "  list       List saved commands and recent runs",
-        "  save <n>   Save the last workflow script as /<name>",
+        "  list   List saved commands and recent runs",
       ].join("\n"), "info");
     },
   });
