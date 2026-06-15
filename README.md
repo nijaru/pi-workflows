@@ -1,6 +1,8 @@
 # pi-workflows
 
-Script-as-plan orchestration for pi. Model writes a JS script, runtime executes it with journal-based resume, model tier routing, and real cost tracking.
+Script-as-plan orchestration for pi. The model writes a JavaScript orchestration script; the runtime executes it with journal-based resume, model tier routing, and real cost tracking.
+
+Use for tasks that need more agents than one conversation can coordinate — codebase audits, migrations, research across many sources, adversarial reviews.
 
 ## Installation
 
@@ -10,78 +12,17 @@ pi install git:github.com/nijaru/pi-workflows
 
 ## Usage
 
-The extension registers a `workflow` tool. The model writes a JavaScript orchestration script; the runtime handles agent execution, parallelism, and resume.
+The extension registers a `workflow` tool. The model writes the script automatically when you ask for a workflow:
 
-```javascript
-export const meta = {
-  name: "code-review",
-  description: "Review code from multiple angles",
-  phases: [
-    { title: "Scan", model: "small" },
-    { title: "Review", model: "big" },
-  ]
-};
-
-const [frontend, backend] = await parallel([
-  () => agent("Review frontend auth", { label: "frontend" }),
-  () => agent("Review backend auth", { label: "backend" }),
-]);
-
-const summary = await agent(`Synthesize findings: ${frontend}\n${backend}`, { label: "synth" });
+```
+Use a workflow to audit every API endpoint under src/routes/ for missing auth checks
 ```
 
-## API
-
-### `agent(prompt, options)`
-
-Run a task with an agent. Options:
-- `label` — short label for status display
-- `model` — explicit model (`provider/modelId`)
-- `tier` — `small`, `medium`, `big` (maps to configured models)
-- `taskType` — `simple`, `code`, `reasoning`, `search`, `review`, `implement`
-- `phase` — assign to a workflow phase
-- `isolation` — `"worktree"` for git-isolated execution
-
-### `parallel(thunks)`
-
-Run array of functions concurrently. Returns results in order.
-
-### `pipeline(items, ...stages)`
-
-Each item flows through stages sequentially. Stage receives `(previousResult, originalItem, index)`.
-
-### `phase(title, { budget? })`
-
-Start a new phase. Optional `budget` caps token spend for that phase.
-
-### `verify(claim, { reviewers? })`
-
-Adversarial verification. Multiple agents evaluate a claim independently, vote on validity.
-
-### `judgePanel(options)`
-
-Tournament-style judging. Agents compare candidates pairwise using a rubric.
-
-### `loopUntilDry(thunk, { maxRounds? })`
-
-Run agent in a loop until it returns `null`. Each round gets previous results.
-
-### `completenessCheck(args, results)`
-
-Adversarial review of whether results satisfy the original task.
-
-### `log(message)`
-
-Record a message in the workflow journal.
-
-### Globals
-
-- `args` — JSON input passed at invocation time
-- `budget` — token budget for the current run
+Workflows run in the background. Your session stays free. Re-running the same workflow resumes from where it left off.
 
 ## Model Tiers
 
-Configure tier-to-model mapping in `~/.pi/workflows/model-tiers.json`:
+The runtime routes agent calls to models via tiers. Configure the mapping in `~/.pi/workflows/model-tiers.json`:
 
 ```json
 {
@@ -91,21 +32,22 @@ Configure tier-to-model mapping in `~/.pi/workflows/model-tiers.json`:
 }
 ```
 
-If not configured, uses built-in defaults.
-
-## Resume
-
-Workflows resume automatically. Each agent call is hashed; completed calls replay from the journal. Re-running the same workflow script skips already-completed steps.
+If not configured, uses built-in defaults. The model can also specify a full `provider/modelId` to override tiers per agent call.
 
 ## Commands
 
-- `/workflows list` — show saved commands and recent runs
-- `/workflows save <name>` — save the last workflow script as `/<name>`
+| Command | Description |
+|---------|-------------|
+| `/workflows list` | Show saved commands and recent runs |
+| `/workflows save <name>` | Save the last workflow script as a reusable command |
 
-## Testing
+## File Structure
 
-```bash
-bun test
+```
+.pi/workflows/<run-id>/
+├── meta.json       # workflow name, script, phases
+├── journal.jsonl   # agent results with hashes for resume
+└── complete.log    # marks run as finished (deleted = resumable)
 ```
 
 ## License
