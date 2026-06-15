@@ -22,7 +22,7 @@ Workflows run in the background. Your session stays free. Re-running the same wo
 
 ## Model Tiers
 
-The runtime routes agent calls to models via tiers. Configure the mapping in `~/.pi/workflows/model-tiers.json`:
+By default, all workflow agents use your configured pi model. To route different tasks to different models, create `~/.pi/workflows/model-tiers.json`:
 
 ```json
 {
@@ -32,7 +32,7 @@ The runtime routes agent calls to models via tiers. Configure the mapping in `~/
 }
 ```
 
-If not configured, uses built-in defaults. The model can also specify a full `provider/modelId` to override tiers per agent call.
+The model can also specify a full `provider/modelId` per agent call to override tiers.
 
 ## Commands
 

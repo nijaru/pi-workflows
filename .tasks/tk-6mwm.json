@@ -1,0 +1,28 @@
+{
+  "project": "tk",
+  "ref": "6mwm",
+  "title": "round-1",
+  "description": "Round 1 of findings",
+  "status": "done",
+  "priority": 2,
+  "labels": null,
+  "assignees": null,
+  "parent": null,
+  "blocked_by": [],
+  "estimate": null,
+  "due_date": null,
+  "logs": [
+    {
+      "ts": "2026-06-15T16:31:46.197348Z",
+      "msg": "Finding 1: The pi-workflows extension is in a complete state — 5/5 tests passing, TypeScript compiles clean, no blockers. The core runtime (VM sandbox, journal, agent/parallel/pipeline) is implemented via pi SDK directly with real token/cost tracking from session.getSessionStats()."
+    },
+    {
+      "ts": "2026-06-15T16:32:10.021336Z",
+      "msg": "Finding 2: P0 — Worktree merge conflict silently loses all changes. The cherry-pick --abort + checkout --theirs handler is a no-op; agent changes are silently discarded on any merge conflict. Fix: use -X theirs on cherry-pick."
+    }
+  ],
+  "created_at": "2026-06-15T16:31:40.829851Z",
+  "updated_at": "2026-06-15T16:33:53.706269Z",
+  "completed_at": "2026-06-15T16:33:53.706269Z",
+  "external": {}
+}

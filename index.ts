@@ -75,7 +75,7 @@ const TASK_TYPE_TIERS: Record<string, "small" | "medium" | "big"> = {
  * Default tier-to-model mapping. Reads from ~/.pi/workflows/model-tiers.json
  * if it exists, otherwise uses sensible defaults based on common model patterns.
  */
-function loadTierConfig(): Record<string, string> {
+function loadTierConfig(): Record<string, string> | null {
   const configPath = join(process.env.HOME ?? "~", ".pi", "workflows", "model-tiers.json");
   try {
     if (existsSync(configPath)) {
@@ -84,13 +84,7 @@ function loadTierConfig(): Record<string, string> {
   } catch (err) {
     console.warn(`[pi-workflows] Failed to parse ${configPath}: ${err instanceof Error ? err.message : err}`);
   }
-  // Defaults: small=flash, medium=primary, big=pro
-  // These are model spec patterns; actual resolution happens via ModelRegistry
-  return {
-    small: "openrouter/deepseek/deepseek-v4-flash",
-    medium: "openrouter/xiaomi/mimo-v2.5-pro",
-    big: "parasail/parasail-kimi-k27-code",
-  };
+  return null;
 }
 
 const TIER_MODELS = loadTierConfig();
@@ -132,7 +126,8 @@ function resolveModel(
     if (phaseDef?.model) return phaseDef.model;
   }
 
-  // Tier-based default
+  // Tier-based default (requires model-tiers.json config)
+  if (!TIER_MODELS) return undefined; // use pi's default model
   const tier = resolveTier(opts, prompt);
   return TIER_MODELS[tier];
 }

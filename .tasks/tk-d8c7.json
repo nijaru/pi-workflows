@@ -1,0 +1,24 @@
+{
+  "project": "tk",
+  "ref": "d8c7",
+  "title": "round-3",
+  "description": "Round 3 of findings",
+  "status": "open",
+  "priority": 1,
+  "labels": null,
+  "assignees": null,
+  "parent": null,
+  "blocked_by": [],
+  "estimate": null,
+  "due_date": null,
+  "logs": [
+    {
+      "ts": "2026-06-15T16:34:56.585018Z",
+      "msg": "Finding 3: P1 — Worktree merge-back uses `-X theirs` strategy, silently discarding conflicting changes from other sources\n\nWhen multiple agents run in parallel with `isolation: \\\"worktree\\\"`, their changes are merged back via cherry-pick with `-X theirs` conflict resolution (index.ts:lines ~530-550). This means if two agents modify the same file, the second agent's changes silently overwrite the first agent's changes. There's no conflict notification, no diff output, and no user awareness that data was lost.\n\nThe merge-back chain is:\n1. Try `git cherry-pick` — fails on conflict\n2. Fall back to `git cherry-pick -X theirs` — silently discards conflicting hunks from the target branch\n3. Fall back to `git merge -X theirs` — same problem, different merge strategy\n\nAll three paths swallow errors with empty catch blocks and only log a generic message. The user has no way to know that changes were discarded.\n\nFix: At minimum, log which files had conflicts and how many hunks were resolved with `-X theirs`. Better: abort on conflict and surface the conflict to the user via a notification or a conflict file in .pi/workflows/\u0026lt;run-id\u0026gt;/conflicts/."
+    }
+  ],
+  "created_at": "2026-06-15T16:34:51.067481Z",
+  "updated_at": "2026-06-15T16:34:56.585018Z",
+  "completed_at": null,
+  "external": {}
+}
