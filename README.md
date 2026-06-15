@@ -1,73 +1,106 @@
 # pi-workflows
 
-Script-as-plan orchestration for pi. Model writes JS, runtime executes.
+Script-as-plan orchestration for pi. Model writes a JS script, runtime executes it with journal-based resume, model tier routing, and real cost tracking.
 
 ## Installation
 
 ```bash
-bun install
+pi install git:github.com/nijaru/pi-workflows
 ```
 
 ## Usage
 
-The extension registers a `workflow` tool that accepts a JavaScript workflow script:
+The extension registers a `workflow` tool. The model writes a JavaScript orchestration script; the runtime handles agent execution, parallelism, and resume.
 
 ```javascript
-// Workflow script format
 export const meta = {
-  name: "my_workflow",
-  description: "What this workflow does",
-  phases: [{ title: "Phase 1" }, { title: "Phase 2" }]
+  name: "code-review",
+  description: "Review code from multiple angles",
+  phases: [
+    { title: "Scan", model: "small" },
+    { title: "Review", model: "big" },
+  ]
 };
 
-// Available globals: agent(), parallel(), pipeline(), log(), phase(), args, budget
-const result = await agent("Search the codebase for auth patterns", {
-  label: "code-search",
-  tier: "small"  // or "medium", "big"
-});
-
-const [a, b] = await parallel([
-  () => agent("Analyze frontend", { label: "frontend" }),
-  () => agent("Analyze backend", { label: "backend" }),
+const [frontend, backend] = await parallel([
+  () => agent("Review frontend auth", { label: "frontend" }),
+  () => agent("Review backend auth", { label: "backend" }),
 ]);
+
+const summary = await agent(`Synthesize findings: ${frontend}\n${backend}`, { label: "synth" });
 ```
 
-## Core API
+## API
 
 ### `agent(prompt, options)`
+
 Run a task with an agent. Options:
-- `label`: Short label for status display
-- `model`: Explicit model override (`provider/modelId`)
-- `tier`: Model tier (`small`, `medium`, `big`)
-- `taskType`: Task classifier (`simple`, `code`, `reasoning`, `search`, `review`, `implement`)
-- `phase`: Assign to a workflow phase
-- `budget`: Per-agent token budget
+- `label` — short label for status display
+- `model` — explicit model (`provider/modelId`)
+- `tier` — `small`, `medium`, `big` (maps to configured models)
+- `taskType` — `simple`, `code`, `reasoning`, `search`, `review`, `implement`
+- `phase` — assign to a workflow phase
+- `isolation` — `"worktree"` for git-isolated execution
 
 ### `parallel(thunks)`
-Run an array of functions concurrently:
-```javascript
-const [a, b] = await parallel([
-  () => agent("Task 1", { label: "t1" }),
-  () => agent("Task 2", { label: "t2" }),
-]);
-```
+
+Run array of functions concurrently. Returns results in order.
 
 ### `pipeline(items, ...stages)`
-Sequential processing pipeline:
-```javascript
-const results = await pipeline(files,
-  (file) => agent(`Read ${file}`, { label: "read" }),
-  (content) => agent(`Summarize: ${content}`, { label: "summarize" }),
-);
-```
+
+Each item flows through stages sequentially. Stage receives `(previousResult, originalItem, index)`.
+
+### `phase(title, { budget? })`
+
+Start a new phase. Optional `budget` caps token spend for that phase.
+
+### `verify(claim, { reviewers? })`
+
+Adversarial verification. Multiple agents evaluate a claim independently, vote on validity.
+
+### `judgePanel(options)`
+
+Tournament-style judging. Agents compare candidates pairwise using a rubric.
+
+### `loopUntilDry(thunk, { maxRounds? })`
+
+Run agent in a loop until it returns `null`. Each round gets previous results.
+
+### `completenessCheck(args, results)`
+
+Adversarial review of whether results satisfy the original task.
+
+### `log(message)`
+
+Record a message in the workflow journal.
+
+### Globals
+
+- `args` — JSON input passed at invocation time
+- `budget` — token budget for the current run
 
 ## Model Tiers
 
-| Tier | Use for |
-|------|---------|
-| `small` | Exploration, reading, searching |
-| `medium` | Default, code generation |
-| `big` | Architecture, complex reasoning |
+Configure tier-to-model mapping in `~/.pi/workflows/model-tiers.json`:
+
+```json
+{
+  "small": "openrouter/deepseek/deepseek-v4-flash",
+  "medium": "openrouter/xiaomi/mimo-v2.5-pro",
+  "big": "parasail/parasail-kimi-k27-code"
+}
+```
+
+If not configured, uses built-in defaults.
+
+## Resume
+
+Workflows resume automatically. Each agent call is hashed; completed calls replay from the journal. Re-running the same workflow script skips already-completed steps.
+
+## Commands
+
+- `/workflows list` — show saved commands and recent runs
+- `/workflows save <name>` — save the last workflow script as `/<name>`
 
 ## Testing
 
@@ -75,13 +108,6 @@ const results = await pipeline(files,
 bun test
 ```
 
-## Architecture
+## License
 
-- Single extension entry: `extensions/pi-workflows/index.ts`
-- Journal persistence: `.pi/workflows/<run-id>/journal.jsonl`
-- Deterministic resume via SHA-256 call hashing
-- VM sandbox with determinism guards (no Math.random/Date.now)
-
-## Design
-
-See [DESIGN.md](DESIGN.md) for the full API design and implementation notes.
+MIT

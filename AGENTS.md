@@ -2,19 +2,15 @@
 
 Script-as-plan orchestration for pi. Model writes JS, runtime executes.
 
-## Design
-
-See DESIGN.md for the full API design and implementation notes.
-
 ## Architecture
 
-- Single extension, ~300-400 lines
-- Entry: `extensions/pi-workflows/index.ts`
+- Single extension: `index.ts` (~990 lines)
 - Journal: `.pi/workflows/<run-id>/journal.jsonl`
-- Three functions: agent(), parallel(), pipeline()
-- Task-type routing (small/medium/big)
-- Worktree isolation for parallel file edits
-- Cost budgets with budget-aware routing
+- Three core functions: agent(), parallel(), pipeline()
+- Quality helpers: verify(), judgePanel(), loopUntilDry(), completenessCheck()
+- Model tier routing (small/medium/big) with task-type classifier
+- Worktree isolation with conflict-safe merge-back
+- Phase budgets with per-phase token caps
 
 ## Stack
 
@@ -22,6 +18,7 @@ See DESIGN.md for the full API design and implementation notes.
 - Pi extension API (`@earendil-works/pi-coding-agent`)
 - Pi TUI (`@earendil-works/pi-tui`)
 - Pi AI types (`@earendil-works/pi-ai`)
+- `@sinclair/typebox` for parameter schemas
 
 ## Testing
 
@@ -31,8 +28,8 @@ bun test
 
 ## Key Patterns
 
-- Script-as-plan: model writes JS, runtime executes
-- Journal resume: crash-safe event log
+- Script-as-plan: model writes JS, runtime executes in VM sandbox
+- Journal resume: SHA-256 call hashing, crash-safe event log
 - Task-type routing: keyword classifier, no deps
-- Worktrees: git isolation for parallel edits
-- Adversarial evaluation: different model for review
+- Worktrees: git isolation for parallel edits with cherry-pick merge
+- Adversarial evaluation: different agents for execution vs review
