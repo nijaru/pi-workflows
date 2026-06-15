@@ -7,9 +7,9 @@
  * Uses pi's SDK directly for agent execution — no external dependencies.
  */
 
-import type { ExtensionAPI, Theme } from "@earendil-works/pi-coding-agent";
+import type { ExtensionAPI, ExtensionContext, Theme } from "@earendil-works/pi-coding-agent";
 import { Type } from "@earendil-works/pi-ai";
-import { Text } from "@earendil-works/pi-tui";
+import { Component, Text } from "@earendil-works/pi-tui";
 import { createHash } from "node:crypto";
 import { execSync } from "node:child_process";
 import { existsSync, mkdirSync, readFileSync, readdirSync, writeFileSync } from "node:fs";
@@ -265,6 +265,29 @@ function extractAssistantText(messages: unknown[]): string {
  * Create an isolated agent session and run a prompt.
  * Returns the assistant's text and real token usage from pi's session stats.
  */
+// Lazy-load pi SDK singletons (created once, reused across all agent calls in a workflow)
+let _sdk: { createAgentSession: any; createCodingTools: any; AuthStorage: any; ModelRegistry: any; SessionManager: any; SettingsManager: any } | undefined;
+async function loadSdk() {
+  if (!_sdk) {
+    // @ts-ignore — runtime import from pi's core SDK
+    _sdk = await import("@earendil-works/pi-coding-agent");
+  }
+  return _sdk;
+}
+
+// Auth + registry created once per process
+let _auth: any;
+let _registry: any;
+function getAuthAndRegistry() {
+  if (!_auth) {
+    const sdk = _sdk!;
+    const agentDir = join(process.env.HOME ?? "~", ".pi", "agent");
+    _auth = sdk.AuthStorage.create(join(agentDir, "auth.json"));
+    _registry = sdk.ModelRegistry.create(_auth, join(agentDir, "models.json"));
+  }
+  return { auth: _auth, registry: _registry };
+}
+
 async function runAgent(
   prompt: string,
   options: {
@@ -274,13 +297,9 @@ async function runAgent(
     signal?: AbortSignal;
   },
 ): Promise<{ text: string; tokens: { input: number; output: number; total: number; cost: number } }> {
-  // @ts-ignore — runtime import from pi's core SDK
-  const { createAgentSession, createCodingTools, AuthStorage, ModelRegistry, SessionManager, SettingsManager } =
-    await import("@earendil-works/pi-coding-agent");
-
+  const sdk = await loadSdk();
+  const { registry } = getAuthAndRegistry();
   const agentDir = join(process.env.HOME ?? "~", ".pi", "agent");
-  const auth = AuthStorage.create(join(agentDir, "auth.json"));
-  const registry = ModelRegistry.create(auth, join(agentDir, "models.json"));
 
   // Resolve model from spec (provider/id format)
   let model: any | undefined;
@@ -295,12 +314,12 @@ async function runAgent(
   }
 
   // Create isolated session with coding tools
-  const { session } = await createAgentSession({
+  const { session } = await sdk.createAgentSession({
     cwd: options.cwd,
     agentDir,
-    sessionManager: SessionManager.inMemory(),
-    settingsManager: SettingsManager.create(options.cwd, agentDir),
-    customTools: createCodingTools(options.cwd),
+    sessionManager: sdk.SessionManager.inMemory(),
+    settingsManager: sdk.SettingsManager.create(options.cwd, agentDir),
+    customTools: sdk.createCodingTools(options.cwd),
     model,
   });
 
@@ -695,6 +714,9 @@ const WorkflowParams = Type.Object({
   resume: Type.Optional(Type.Boolean({
     description: "Resume from last incomplete run of same workflow name (default: true).",
   })),
+  forceResume: Type.Optional(Type.Boolean({
+    description: "Allow resuming a run that previously errored (default: false).",
+  })),
 });
 
 function createWorkflowTool() {
@@ -712,7 +734,7 @@ function createWorkflowTool() {
 
     parameters: WorkflowParams,
 
-    renderCall(args: { script: string; background?: boolean }, theme: Theme) {
+    renderCall(args: { script: string; background?: boolean }, theme: Theme, _context?: { lastComponent?: Component; invalidate?: () => void }) {
       const meta = parseScriptSafe(args.script);
       const label = meta?.name ?? "workflow";
       return new Text(
@@ -723,20 +745,21 @@ function createWorkflowTool() {
       );
     },
 
-    renderResult(r: { content: Array<{ type: string; text?: string }>; details?: unknown }, _: unknown, theme: Theme) {
+    renderResult(r: { content: Array<{ type: string; text?: string }>; details?: unknown }, _: unknown, theme: Theme, context?: { isError?: boolean; lastComponent?: Component }) {
       const text = r.content[0]?.type === "text" ? (r.content[0] as { text?: string }).text ?? "" : "";
       const details = r.details as Record<string, unknown> | undefined;
-      if (details?.background) {
+      const prefix = context?.isError ? theme.fg("error", "✗ ") : theme.fg("success", "✓ ");
+      if (details?.background && !context?.isError) {
         return new Text(
           theme.fg("success", "▶ ") + theme.fg("text", text) +
           theme.fg("dim", ` [run: ${details.runId}]`),
           0, 0
         );
       }
-      return new Text(theme.fg("success", "✓ ") + theme.fg("text", text), 0, 0);
+      return new Text(prefix + theme.fg("text", text), 0, 0);
     },
 
-    async execute(_id: string, params: { script: string; args?: unknown; background?: boolean; tokenBudget?: number; maxAgents?: number; resume?: boolean }, signal?: AbortSignal) {
+    async execute(_id: string, params: { script: string; args?: unknown; background?: boolean; tokenBudget?: number; maxAgents?: number; resume?: boolean; forceResume?: boolean }, signal?: AbortSignal, _onUpdate?: unknown, ctx?: ExtensionContext) {
       let script = params.script.trim();
       const fence = script.match(/^```(?:js|javascript)?\s*\n([\s\S]*?)\n```$/i);
       if (fence?.[1]) script = fence[1].trim();
@@ -749,10 +772,11 @@ function createWorkflowTool() {
       let runId: string | undefined;
       let resumeJournal: Map<number, JournalEntry> | undefined;
       
+      const shouldForceResume = params.forceResume === true;
       if (shouldResume) {
         const runs = listWorkflowRuns(cwd);
         for (const r of runs) {
-          if (r.meta?.name === meta.name && r.status !== "error") {
+          if (r.meta?.name === meta.name && (shouldForceResume || r.status !== "error")) {
             const journal = readJournal(cwd, r.runId);
             if (journal.size > 0) {
               // Check if this run is incomplete (no completion marker)
@@ -801,6 +825,9 @@ function createWorkflowTool() {
             writeFileSync(join(dir, "error.log"), `[${new Date().toISOString()}] ${error}\n`);
           } catch {}
           console.error(`[pi-workflows] Background workflow ${runId} failed: ${error}`);
+          if (ctx) {
+            ctx.ui.notify(`Workflow "${meta.name}" failed: ${error}`, "error");
+          }
         });
 
         const resumedMsg = resumeJournal ? ` (resumed from ${resumeJournal.size} cached)` : "";
@@ -873,7 +900,6 @@ function listWorkflowRuns(cwd: string): Array<{ runId: string; meta: WorkflowMet
     for (const entry of entries) {
       if (entry === "commands" || !entry.startsWith("run-")) continue;
       const metaPath = join(dir, entry, "meta.json");
-      const journalPath = join(dir, entry, "journal.jsonl");
       const errorPath = join(dir, entry, "error.log");
       const completePath = join(dir, entry, "complete.log");
       const hasError = existsSync(errorPath);
@@ -942,10 +968,38 @@ export default function registerExtension(pi: ExtensionAPI) {
         return;
       }
       
+      if (cmd.startsWith("save ")) {
+        const name = cmd.slice(5).trim();
+        if (!name) {
+          ctx.ui.notify("Usage: /workflows save <name>", "error");
+          return;
+        }
+        // Find the most recent workflow tool call in the session
+        const entries = ctx.sessionManager.getEntries();
+        for (let i = entries.length - 1; i >= 0; i--) {
+          const entry = entries[i];
+          if (entry.type === "message" && entry.message.role === "assistant" && Array.isArray(entry.message.content)) {
+            const toolUse = (entry.message.content as any[]).find(
+              (c: any) => c.type === "tool_use" && c.name === "workflow"
+            );
+            if (toolUse?.input?.script) {
+              const saveDir = join(cwd, COMMANDS_DIR);
+              mkdirSync(saveDir, { recursive: true });
+              writeFileSync(join(saveDir, `${name}.js`), toolUse.input.script);
+              ctx.ui.notify(`Saved workflow as /${name}`, "info");
+              return;
+            }
+          }
+        }
+        ctx.ui.notify("No recent workflow found to save. Run a workflow first.", "error");
+        return;
+      }
+
       ctx.ui.notify([
-        "Usage: /workflows [list]",
+        "Usage: /workflows [list|save]",
         "",
-        "  list   List saved commands and recent runs",
+        "  list         List saved commands and recent runs",
+        "  save <name>  Save the last workflow as a reusable command",
       ].join("\n"), "info");
     },
   });
