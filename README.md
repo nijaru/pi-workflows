@@ -38,8 +38,7 @@ The model can also specify a full `provider/modelId` per agent call to override 
 
 | Command | Description |
 |---------|-------------|
-| `/workflows list` | Show saved commands and recent runs |
-| `/workflows save <name>` | Save the last workflow script as a reusable command |
+| `/workflows list` | Show recent workflow runs |
 
 ## File Structure
 
