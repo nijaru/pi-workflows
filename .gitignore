@@ -5,3 +5,5 @@ dist
 .pi/
 ai/
 *.log
+CLAUDE.md
+review.md
