@@ -340,7 +340,7 @@ async function runAgent(
         input: stats.tokens.input,
         output: stats.tokens.output,
         total: stats.tokens.total,
-        cost: stats.cost,
+        cost: stats.cost ?? 0,
       },
     };
   } finally {
@@ -448,7 +448,7 @@ async function executeWorkflow(
       shared.tokenUsage.input += cached.tokens.input;
       shared.tokenUsage.output += cached.tokens.output;
       shared.tokenUsage.total += cached.tokens.total;
-      shared.tokenUsage.cost += cached.tokens.cost;
+      shared.tokenUsage.cost += cached.tokens.cost ?? 0;
       shared.spent += cached.tokens.total;
       return cached.result as string;
     }
