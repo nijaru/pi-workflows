@@ -20,6 +20,43 @@ Use a workflow to audit every API endpoint under src/routes/ for missing auth ch
 
 Workflows run in the background. Your session stays free. Re-running the same workflow resumes from where it left off.
 
+The generated script looks like this:
+
+```javascript
+export const meta = { name: "api-auth-audit", description: "Check all endpoints for auth" };
+
+phase("scan");
+const endpoints = await agent("List all API route files under src/routes/");
+
+phase("review", { budget: 50000 });
+const results = await parallel(
+  endpoints.map(ep => () => agent(`Audit ${ep} for missing auth middleware`))
+);
+
+const report = await agent(`Summarize findings: ${JSON.stringify(results)}`);
+return report;
+```
+
+The model writes this. You don't need to know the syntax.
+
+## Commands
+
+| Command | Description |
+|---------|-------------|
+| `/workflows list` | Show recent runs and saved commands |
+| `/workflows save <name>` | Save the last workflow as a reusable command |
+| `/workflows pause <runId>` | Pause a running workflow (resume by running again) |
+
+## Parameters
+
+| Parameter | Default | Description |
+|-----------|---------|-------------|
+| `tokenBudget` | unlimited | Hard token cap for the run |
+| `maxAgents` | 1000 | Maximum agent calls allowed |
+| `dryRun` | false | Validate and preview without executing |
+| `resume` | true | Resume from last incomplete run of same name |
+| `forceResume` | false | Retry a run that previously errored |
+
 ## Model Tiers
 
 By default, all workflow agents use your configured pi model. To route different tasks to different models, create `~/.pi/workflows/model-tiers.json`:
@@ -33,12 +70,6 @@ By default, all workflow agents use your configured pi model. To route different
 ```
 
 The model can also specify a full `provider/modelId` per agent call to override tiers.
-
-## Commands
-
-| Command | Description |
-|---------|-------------|
-| `/workflows list` | Show recent workflow runs |
 
 ## File Structure
 
