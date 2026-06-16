@@ -81,9 +81,7 @@ function loadTierConfig(): Record<string, string> | null {
     if (existsSync(configPath)) {
       return JSON.parse(readFileSync(configPath, "utf-8"));
     }
-  } catch (err) {
-    console.warn(`[pi-workflows] Failed to parse ${configPath}: ${err instanceof Error ? err.message : err}`);
-  }
+  } catch {}
   return null;
 }
 
@@ -144,7 +142,7 @@ const DETERMINISM_PRELUDE = [
   '"use strict";',
   'Math.random = () => { throw new Error("Math.random() unavailable in workflow"); };',
   'const _D = Date;',
-  'const _ND = function(...a) { if (!a.length) throw new Error("new Date() without args is non-deterministic. Use new Date(\"2024-01-01\") or Date.UTC() instead."); return Reflect.construct(_D, a, _ND); };',
+  'const _ND = function(...a) { if (!a.length) throw new Error("new Date() without args is non-deterministic. Use new Date(\"2024-01-01\") or Date.UTC() instead."); return new _D(...a); };',
   '_ND.UTC = _D.UTC; _ND.parse = _D.parse; _ND.now = () => { throw new Error("Date.now() unavailable in workflow"); };',
   '_ND.prototype = _D.prototype; globalThis.Date = _ND;',
 ].join("\n");
@@ -410,13 +408,8 @@ async function executeWorkflow(
   };
 
   const throwIfPaused = () => {
-    try {
-      if (existsSync(join(cwd, WORKFLOW_DIR, runId, "paused"))) {
-        throw new Error("Workflow paused");
-      }
-    } catch (e) {
-      if (e instanceof Error && e.message === "Workflow paused") throw e;
-    }
+    const pauseFile = join(cwd, WORKFLOW_DIR, runId, "paused");
+    if (existsSync(pauseFile)) throw new Error("Workflow paused");
   };
 
   // ── agent() — the core primitive ──────────────────────────────────
@@ -850,15 +843,18 @@ function createWorkflowTool() {
         }).catch((err) => {
           const error = err instanceof Error ? err.message : String(err);
           const isPaused = error === "Workflow paused";
+          const isAborted = signal?.aborted || error === "Workflow aborted";
           const dir = join(cwd, WORKFLOW_DIR, runId!);
           try {
             mkdirSync(dir, { recursive: true });
             if (isPaused) {
               // Journal is preserved on disk — resume with same runId
               if (ctx) ctx.ui.notify(`Workflow "${meta.name}" paused. Resume by running again (runId: ${runId}).`, "info");
+            } else if (isAborted) {
+              // Deliberate cancellation — not an error
+              if (ctx) ctx.ui.notify(`Workflow "${meta.name}" cancelled.`, "info");
             } else {
               writeFileSync(join(dir, "error.log"), `[${new Date().toISOString()}] ${error}\n`);
-              console.error(`[pi-workflows] Background workflow ${runId} failed: ${error}`);
               if (ctx) ctx.ui.notify(`Workflow "${meta.name}" failed: ${error}`, "error");
             }
           } catch {}
