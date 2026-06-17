@@ -30,6 +30,8 @@ Workflows run in the background. Your session stays free. Re-running a workflow 
 | Real cost tracking | Token counts and costs from pi's session stats, not estimates |
 | Adversarial verification | Built-in `verify()` and `judgePanel()` for quality checks |
 | Dry run | Preview and validate a workflow without executing |
+| Status checks | `workflow_status` tool to monitor background runs |
+| Cleanup | `/workflows clean` to prune old run directories |
 
 ## Commands
 
@@ -40,6 +42,7 @@ User commands — type these in the pi TUI:
 | `/workflows list` | Show recent runs and saved commands |
 | `/workflows save <name>` | Save the last workflow as a reusable command |
 | `/workflows pause <runId>` | Pause a running workflow (resume by running again) |
+| `/workflows clean [days]` | Remove completed/errored runs older than N days (default: 7) |
 
 ## Parameters
 
@@ -52,6 +55,14 @@ Agent parameters — the model sets these automatically:
 | `dryRun` | false | Validate and preview without executing |
 | `resume` | true | Resume from last incomplete run of same name |
 | `forceResume` | false | Retry a run that previously errored |
+
+## Checking Status
+
+After a workflow starts in the background, use `workflow_status` to check progress:
+
+- Pass the `runId` from the workflow result, or omit for the most recent run
+- Filter by workflow name with `workflow`
+- Returns: status, agent count, token usage, errors, and completion results
 
 ## Model Tiers
 

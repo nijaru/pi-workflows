@@ -12,7 +12,7 @@ import { Type } from "@earendil-works/pi-ai";
 import { Component, Text } from "@earendil-works/pi-tui";
 import { createHash } from "node:crypto";
 import { execSync } from "node:child_process";
-import { existsSync, mkdirSync, readFileSync, readdirSync, writeFileSync } from "node:fs";
+import { existsSync, mkdirSync, readFileSync, readdirSync, rmSync, statSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import vm from "node:vm";
 
@@ -146,6 +146,9 @@ const DETERMINISM_PRELUDE = [
   '_ND.UTC = _D.UTC; _ND.parse = _D.parse; _ND.now = () => { throw new Error("Date.now() unavailable in workflow"); };',
   '_ND.prototype = _D.prototype; globalThis.Date = _ND;',
 ].join("\n");
+
+// Lines before the body starts: prelude lines + 1 for `(async () => {`
+const WRAPPER_OFFSET = DETERMINISM_PRELUDE.split("\n").length + 1;
 
 // ── Journal Persistence ────────────────────────────────────────────────────
 
@@ -350,6 +353,35 @@ async function runAgent(
 }
 
 // ── Workflow Runtime ───────────────────────────────────────────────────────
+
+/**
+ * Enrich a vm.Script SyntaxError with line:column context from the original script body.
+ * V8 errors include `filename:line:col` in the stack trace — we offset by the prelude
+ * lines to map back to the user's script.
+ */
+function enrichSyntaxError(err: SyntaxError, body: string, filename = "workflow"): SyntaxError {
+  const lines = body.split("\n");
+  const lineMatch = err.stack?.match(/:(\d+):(\d+)/);
+  if (lineMatch) {
+    const rawLine = parseInt(lineMatch[1], 10);
+    const col = parseInt(lineMatch[2], 10);
+    const scriptLine = rawLine - WRAPPER_OFFSET - 1; // 0-indexed into body
+    if (scriptLine >= 0 && scriptLine < lines.length) {
+      const start = Math.max(0, scriptLine - 2);
+      const end = Math.min(lines.length, scriptLine + 3);
+      const context = [] as string[];
+      for (let i = start; i < end; i++) {
+        const marker = i === scriptLine ? ">>>" : "   ";
+        context.push(`  ${marker} ${i + 1}: ${lines[i]}`);
+        if (i === scriptLine) {
+          context.push(`         ${" ".repeat(col)}^`);
+        }
+      }
+      err.message = `${err.message}\n\n  at ${filename}.js:${scriptLine + 1}:${col}\n\n${context.join("\n")}`;
+    }
+  }
+  return err;
+}
 
 async function executeWorkflow(
   script: string,
@@ -666,7 +698,16 @@ ${JSON.stringify(results).slice(0, 4000)}`, { label: "completeness critic" });
   });
 
   const wrapped = `${DETERMINISM_PRELUDE}\n(async () => {\n${body}\n})()`;
-  const result = await new vm.Script(wrapped, { filename: `${meta.name}.js` }).runInContext(context);
+  let compiled: vm.Script;
+  try {
+    compiled = new vm.Script(wrapped, { filename: `${meta.name}.js` });
+  } catch (err) {
+    if (err instanceof SyntaxError) {
+      throw enrichSyntaxError(err, body, meta.name);
+    }
+    throw err;
+  }
+  const result = await compiled.runInContext(context);
 
   return {
     meta,
@@ -730,6 +771,7 @@ function createWorkflowTool() {
       "Globals: agent(prompt, opts), parallel(fns), pipeline(items, ...stages), phase(title, {budget}), log(msg), args, budget, verify(), judgePanel(), loopUntilDry(), completenessCheck()",
       "Scripts have no direct filesystem or shell access. All side effects go through agent() calls.",
       "Date.now(), Math.random(), and new Date() without args are blocked. Explicit dates like new Date(\"2024-01-01\") and Date.UTC() are allowed.",
+      "Example: `export const meta = { name: \"review\", description: \"Review files\" }; const files = [\"a.ts\", \"b.ts\"]; await parallel(files.map(f => () => agent(\`Review ${f}\`, { label: f })));`",
     ],
 
     parameters: WorkflowParams,
@@ -775,10 +817,19 @@ function createWorkflowTool() {
       const fence = script.match(/^```(?:js|javascript)?\s*\n([\s\S]*?)\n```$/i);
       if (fence?.[1]) script = fence[1].trim();
 
-      const { meta } = parseScript(script);
+      const { meta, body } = parseScript(script);
 
-      // Dry run: return metadata without executing
+      // Dry run: validate syntax and return metadata without executing
       if (params.dryRun) {
+        const wrapped = `${DETERMINISM_PRELUDE}\n(async () => {\n${body}\n})()`;
+        try {
+          new vm.Script(wrapped, { filename: `${meta.name}.js` });
+        } catch (err) {
+          if (err instanceof SyntaxError) {
+            throw enrichSyntaxError(err, body, meta.name);
+          }
+          throw err;
+        }
         return ok(
           `Workflow "${meta.name}": ${meta.description}${meta.phases ? `, ${meta.phases.length} phase(s)` : ""}. ` +
           `Script is valid and ready to run.` +
@@ -886,6 +937,162 @@ function createWorkflowTool() {
   };
 }
 
+// ── Workflow Status Tool ──────────────────────────────────────────────────
+
+function getRunStatus(cwd: string, runId: string): Record<string, unknown> | null {
+  const dir = join(cwd, WORKFLOW_DIR, runId);
+  if (!existsSync(dir)) return null;
+
+  const metaPath = join(dir, "meta.json");
+  const errorPath = join(dir, "error.log");
+  const completePath = join(dir, "complete.log");
+  const journalPath = join(dir, "journal.jsonl");
+
+  const hasError = existsSync(errorPath);
+  const hasComplete = existsSync(completePath);
+  const hasPaused = existsSync(join(dir, "paused"));
+  const status = hasError ? "error" : hasComplete ? "completed" : hasPaused ? "paused" : "running";
+
+  let meta: WorkflowMeta | null = null;
+  let agentCount = 0;
+  let tokenUsage = { input: 0, output: 0, total: 0, cost: 0 };
+  let error: string | undefined;
+  let result: unknown;
+
+  try {
+    if (existsSync(metaPath)) {
+      const parsed = JSON.parse(readFileSync(metaPath, "utf-8"));
+      meta = { name: parsed.name, description: parsed.description, phases: parsed.phases };
+    }
+  } catch {}
+
+  try {
+    if (existsSync(journalPath)) {
+      const lines = readFileSync(journalPath, "utf-8").split("\n").filter(l => l.trim());
+      agentCount = lines.length;
+      for (const line of lines) {
+        try {
+          const entry = JSON.parse(line);
+          if (entry.tokens) {
+            tokenUsage.input += entry.tokens.input ?? 0;
+            tokenUsage.output += entry.tokens.output ?? 0;
+            tokenUsage.total += entry.tokens.total ?? 0;
+            tokenUsage.cost += entry.tokens.cost ?? 0;
+          }
+        } catch {}
+      }
+    }
+  } catch {}
+
+  try { if (hasError) error = readFileSync(errorPath, "utf-8").trim(); } catch {}
+  try { if (hasComplete) result = JSON.parse(readFileSync(completePath, "utf-8")); } catch {}
+
+  return {
+    runId,
+    status,
+    meta,
+    agentCount,
+    tokenUsage,
+    ...(error ? { error } : {}),
+    ...(result ? { result } : {}),
+  };
+}
+
+function createWorkflowStatusTool() {
+  return {
+    name: "workflow_status",
+    label: "Workflow Status",
+    description: "Check the status of a workflow run — progress, token usage, errors, and results.",
+    promptSnippet: "Check workflow status after background execution.",
+    promptGuidelines: [
+      "Call workflow_status after a workflow() returns 'started in background' to check if it completed.",
+      "Pass the runId from the workflow() result, or omit to check the most recent run.",
+    ],
+
+    parameters: Type.Object({
+      runId: Type.Optional(Type.String({
+        description: "Run ID from the workflow() result. Omit to check the most recent run.",
+      })),
+      workflow: Type.Optional(Type.String({
+        description: "Find the most recent run for this workflow name (alternative to runId).",
+      })),
+    }),
+
+    renderCall(args: { runId?: string; workflow?: string }, theme: Theme, context?: { lastComponent?: Component; invalidate?: () => void; args?: unknown; state?: Record<string, unknown>; toolCallId?: string; cwd?: string; executionStarted?: boolean; argsComplete?: boolean; isPartial?: boolean; expanded?: boolean; showImages?: boolean; isError?: boolean }) {
+      const existing = context?.lastComponent as Text | undefined;
+      const label = args.runId ?? args.workflow ?? "latest";
+      const content = theme.fg("toolTitle", theme.bold("workflow_status ")) + theme.fg("accent", label.slice(0, 40));
+      if (existing) { existing.setText(content); return existing; }
+      return new Text(content, 0, 0);
+    },
+
+    renderResult(
+      r: { content: Array<{ type: string; text?: string }>; details?: unknown },
+      opts: { expanded?: boolean; isPartial?: boolean },
+      theme: Theme,
+      context?: { isError?: boolean; lastComponent?: Component; invalidate?: () => void; args?: unknown; state?: Record<string, unknown>; toolCallId?: string; cwd?: string; executionStarted?: boolean; argsComplete?: boolean; isPartial?: boolean; expanded?: boolean; showImages?: boolean },
+    ) {
+      const text = r.content[0]?.type === "text" ? (r.content[0] as { text?: string }).text ?? "" : "";
+      const prefix = context?.isError ? theme.fg("error", "✗ ") : theme.fg("success", "✓ ");
+      return new Text(prefix + theme.fg("text", text), 0, 0);
+    },
+
+    async execute(_id: string, params: { runId?: string; workflow?: string }, _signal?: AbortSignal, _onUpdate?: unknown, ctx?: ExtensionContext) {
+      const cwd = process.cwd();
+
+      // Find the target run
+      let targetRunId: string | undefined;
+
+      if (params.runId) {
+        targetRunId = params.runId;
+      } else {
+        // Find most recent run (optionally filtered by workflow name)
+        const runs = listWorkflowRuns(cwd);
+        const filtered = params.workflow
+          ? runs.filter(r => r.meta?.name === params.workflow)
+          : runs;
+        if (filtered.length > 0) {
+          targetRunId = filtered[filtered.length - 1].runId;
+        }
+      }
+
+      if (!targetRunId) {
+        throw new Error("No workflow runs found.");
+      }
+
+      const status = getRunStatus(cwd, targetRunId);
+      if (!status) {
+        throw new Error(`Run ${targetRunId} not found.`);
+      }
+
+      // Format output
+      const parts: string[] = [];
+      const meta = status.meta as WorkflowMeta | null;
+      parts.push(`Workflow: ${meta?.name ?? targetRunId}`);
+      if (meta?.description) parts.push(`Description: ${meta.description}`);
+      parts.push(`Status: ${status.status}`);
+      parts.push(`Agents: ${status.agentCount}`);
+
+      const tokens = status.tokenUsage as { total: number; cost: number };
+      if (tokens.total > 0) {
+        parts.push(`Tokens: ${tokens.total.toLocaleString()} ($${tokens.cost.toFixed(4)})`);
+      }
+
+      if (status.error) {
+        parts.push(`Error: ${status.error}`);
+      }
+
+      if (status.result) {
+        const result = status.result as WorkflowRunResult;
+        if (result.durationMs) parts.push(`Duration: ${(result.durationMs / 1000).toFixed(1)}s`);
+        if (result.phases?.length) parts.push(`Phases: ${result.phases.join(", ")}`);
+      }
+
+      return ok(parts.join("\n"), status);
+    },
+  };
+}
+
 // ── Workflow Commands ──────────────────────────────────────────────────────
 
 function listSavedCommands(cwd: string): Array<{ name: string; path: string }> {
@@ -961,7 +1168,9 @@ function listWorkflowRuns(cwd: string): Array<{ runId: string; meta: WorkflowMet
 
 export default function registerExtension(pi: ExtensionAPI) {
   const tool = createWorkflowTool();
+  const statusTool = createWorkflowStatusTool();
   pi.registerTool(tool);
+  pi.registerTool(statusTool);
 
   // Register /workflows command
   pi.registerCommand("workflows", {
@@ -1026,6 +1235,31 @@ export default function registerExtension(pi: ExtensionAPI) {
         return;
       }
 
+      if (cmd.startsWith("clean")) {
+        const arg = cmd.slice(5).trim();
+        const parsed = parseInt(arg, 10);
+        const maxAgeDays = Number.isFinite(parsed) && parsed >= 0 ? parsed : 7;
+        const cutoff = Date.now() - maxAgeDays * 24 * 60 * 60 * 1000;
+        const runs = listWorkflowRuns(cwd);
+        let cleaned = 0;
+        for (const r of runs) {
+          if (r.status === "running") continue; // don't touch active runs
+          try {
+            const dir = join(cwd, WORKFLOW_DIR, r.runId);
+            const metaPath = join(dir, "meta.json");
+            if (existsSync(metaPath)) {
+              const stat = statSync(metaPath);
+              if (stat.mtimeMs < cutoff) {
+                rmSync(dir, { recursive: true, force: true });
+                cleaned++;
+              }
+            }
+          } catch {}
+        }
+        ctx.ui.notify(`Cleaned ${cleaned} run(s) older than ${maxAgeDays} day(s).`, "info");
+        return;
+      }
+
       if (cmd.startsWith("pause ")) {
         const targetRunId = cmd.slice(6).trim();
         if (!targetRunId) {
@@ -1049,24 +1283,26 @@ export default function registerExtension(pi: ExtensionAPI) {
       }
 
       ctx.ui.notify([
-        "Usage: /workflows [list|save|pause]",
+        "Usage: /workflows [list|save|pause|clean]",
         "",
-        "  list           List saved commands and recent runs",
-        "  save <name>    Save the last workflow as a reusable command",
-        "  pause <runId>  Pause a running workflow (resume with same runId)",
+        "  list             List saved commands and recent runs",
+        "  save <name>      Save the last workflow as a reusable command",
+        "  pause <runId>    Pause a running workflow (resume with same runId)",
+        "  clean [days]     Remove completed/errored runs older than N days (default: 7)",
       ].join("\n"), "info");
     },
   });
 
   pi.on("session_start", () => {
     const active = pi.getActiveTools();
-    if (!active.includes(tool.name)) {
-      pi.setActiveTools([...active, tool.name]);
+    const toAdd = [tool.name, statusTool.name].filter(n => !active.includes(n));
+    if (toAdd.length) {
+      pi.setActiveTools([...active, ...toAdd]);
     }
   });
 }
 
 // ── Exports ───────────────────────────────────────────────────────────────
 
-export { executeWorkflow, parseScript, createWorkflowTool };
+export { executeWorkflow, parseScript, createWorkflowTool, createWorkflowStatusTool, enrichSyntaxError, getRunStatus };
 export type { WorkflowMeta, AgentOptions, WorkflowRunResult, JournalEntry };

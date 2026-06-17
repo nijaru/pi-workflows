@@ -4,7 +4,7 @@ Script-as-plan orchestration for pi. Model writes JS, runtime executes in a sand
 
 ## Architecture
 
-- Single extension: `index.ts` (~1072 lines)
+- Single extension: `index.ts` (~1330 lines)
 - Journal: `.pi/workflows/<run-id>/journal.jsonl`
 - Three core functions: agent(), parallel(), pipeline()
 - Quality helpers: verify(), judgePanel(), loopUntilDry(), completenessCheck()
@@ -12,8 +12,11 @@ Script-as-plan orchestration for pi. Model writes JS, runtime executes in a sand
 - Worktree isolation with conflict-safe merge-back
 - Phase budgets with per-phase token caps
 - Background by default, blocking with `background: false`
-- `dryRun` parameter for preview without execution
+- `dryRun` parameter for preview without execution (validates syntax)
 - In-session pause/resume via pause marker file
+- `workflow_status` tool for checking background run progress
+- `/workflows clean` command to prune old run directories
+- Syntax errors enriched with line:column context and code snippet
 
 ## Stack
 
@@ -87,6 +90,7 @@ The VM sandbox exposes only: `agent`, `parallel`, `pipeline`, `log`, `phase`, `v
 | `/workflows list` | Show recent runs and saved commands |
 | `/workflows save <name>` | Save last workflow as reusable command |
 | `/workflows pause <runId>` | Pause running workflow (resume by running again) |
+| `/workflows clean [days]` | Remove completed/errored runs older than N days (default: 7) |
 
 ## Tool Parameters
 
@@ -100,6 +104,14 @@ The VM sandbox exposes only: `agent`, `parallel`, `pipeline`, `log`, `phase`, `v
 | `resume` | true | Resume from last incomplete run of same name |
 | `forceResume` | false | Retry a run that previously errored |
 | `dryRun` | false | Validate and preview without executing |
+
+## workflow_status Tool
+
+Call after a background `workflow()` to check progress:
+
+- Accepts `runId` (from workflow result) or `workflow` (name filter)
+- Returns: status, agent count, token usage, error message, completion result
+- Defaults to most recent run if neither parameter provided
 
 ## Key Patterns
 
