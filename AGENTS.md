@@ -82,6 +82,8 @@ The VM sandbox exposes only: `agent`, `parallel`, `pipeline`, `log`, `phase`, `v
 - **Resume scanning:** `listWorkflowRuns()` scans by workflow name. Multiple incomplete runs for the same name is unlikely but possible — picks first match.
 - **Worktree merge:** Cherry-pick with `-X theirs` fallback, then `git merge` fallback. Conflicts are logged, not fatal.
 - **Determinism prelude:** `Date` constructor wrapper uses `new _D(...a)`, not `Reflect.construct`.
+- **Synchronous syntax validation:** `execute()` compiles the wrapped script with `vm.Script` before any execution path. Syntax errors throw immediately as the tool result (with line context + heuristic suggestions from `suggestSyntaxFix`) instead of failing asynchronously in the background.
+- **Error enrichment:** `enrichSyntaxError()` maps V8 line:col back to the script body and appends `suggestSyntaxFix()` hints (unbalanced parens, odd backticks, unmatched braces/brackets).
 
 ## Commands
 
