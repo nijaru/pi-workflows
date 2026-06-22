@@ -1,5 +1,5 @@
 import { describe, test, expect } from "bun:test";
-import { parseScript, enrichSyntaxError, suggestSyntaxFix } from "./index";
+import { parseScript, enrichSyntaxError, suggestSyntaxFix, validateSyntax } from "./index";
 
 describe("pi-workflows", () => {
   describe("parseScript", () => {
@@ -116,6 +116,32 @@ const d = new Date("2024-01-01");
       const hasBacktickTip = tip.includes("backtick");
       expect(hasParensTip || tip === "").toBe(true);
       expect(hasBacktickTip).toBe(false);
+    });
+  });
+
+  describe("validateSyntax", () => {
+    test("returns null for valid script body", () => {
+      const body = 'await agent("do work", { label: "worker" });';
+      expect(validateSyntax(body, "test")).toBeNull();
+    });
+
+    test("catches missing close paren (eagerly, unlike vm.Script)", () => {
+      const body = 'const x = agent("test"';
+      const err = validateSyntax(body, "test");
+      expect(err).not.toBeNull();
+      expect(err instanceof SyntaxError).toBe(true);
+    });
+
+    test("catches unterminated template literal", () => {
+      const body = "const x = agent(`unterminated prompt";
+      const err = validateSyntax(body, "test");
+      expect(err).not.toBeNull();
+    });
+
+    test("catches unbalanced braces", () => {
+      const body = 'const x = { a: 1, b: [1, 2';
+      const err = validateSyntax(body, "test");
+      expect(err).not.toBeNull();
     });
   });
 });

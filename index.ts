@@ -142,7 +142,7 @@ const DETERMINISM_PRELUDE = [
   '"use strict";',
   'Math.random = () => { throw new Error("Math.random() unavailable in workflow"); };',
   'const _D = Date;',
-  'const _ND = function(...a) { if (!a.length) throw new Error("new Date() without args is non-deterministic. Use new Date(\"2024-01-01\") or Date.UTC() instead."); return new _D(...a); };',
+  'const _ND = function(...a) { if (!a.length) throw new Error("new Date() without args is non-deterministic. Use new Date(\'2024-01-01\') or Date.UTC() instead."); return new _D(...a); };',
   '_ND.UTC = _D.UTC; _ND.parse = _D.parse; _ND.now = () => { throw new Error("Date.now() unavailable in workflow"); };',
   '_ND.prototype = _D.prototype; globalThis.Date = _ND;',
 ].join("\n");
@@ -384,6 +384,30 @@ function suggestSyntaxFix(message: string, body: string): string {
     }
   }
   return tips.length > 0 ? `\n\n  Likely cause: ${tips.join("; ")}` : "";
+}
+
+/**
+ * Eagerly validate script syntax. Returns null if valid, or an enriched SyntaxError.
+ *
+ * Bun's `node:vm.Script` DEFERS parsing — `new vm.Script(brokenCode)` succeeds and
+ * the SyntaxError only surfaces at `runInContext()` time. We use `new Function()`
+ * instead, which eagerly parses on both Node and Bun, so syntax errors are caught
+ * before backgrounding rather than failing asynchronously.
+ */
+function validateSyntax(body: string, metaName: string): SyntaxError | null {
+  const wrapped = `${DETERMINISM_PRELUDE}\n(async () => {\n${body}\n})()`;
+  try {
+    // eslint-disable-next-line @typescript-eslint/no-implied-eval
+    new Function(wrapped);
+    return null;
+  } catch (err) {
+    if (err instanceof SyntaxError) {
+      return enrichSyntaxError(err, body, metaName);
+    }
+    // Non-SyntaxError from Function constructor — wrap as a generic error
+    const synthetic = new SyntaxError(err instanceof Error ? err.message : String(err));
+    return enrichSyntaxError(synthetic, body, metaName);
+  }
 }
 
 /**
@@ -743,7 +767,20 @@ ${JSON.stringify(results).slice(0, 4000)}`, { label: "completeness critic" });
     }
     throw err;
   }
-  const result = await compiled.runInContext(context);
+  let result: unknown;
+  try {
+    result = await compiled.runInContext(context);
+  } catch (err) {
+    // Bun defers vm.Script parsing — a SyntaxError can surface here at runtime.
+    // Also catches errors from the workflow body itself. Enrich parse errors
+    // and dump the script for forensics.
+    const msg = err instanceof Error ? err.message : String(err);
+    if (/syntax|unexpected|missing|unterminated|unbalanced/i.test(msg)) {
+      const synthetic = new SyntaxError(msg);
+      throw enrichSyntaxError(synthetic, body, meta.name);
+    }
+    throw err;
+  }
 
   return {
     meta,
@@ -858,17 +895,10 @@ function createWorkflowTool() {
       const { meta, body } = parseScript(script);
 
       // Validate syntax BEFORE any execution path.
-      // Catches syntax errors synchronously so the model gets an actionable
-      // error as the tool result instead of a background failure notification.
-      const wrapped = `${DETERMINISM_PRELUDE}\n(async () => {\n${body}\n})()`;
-      try {
-        new vm.Script(wrapped, { filename: `${meta.name}.js` });
-      } catch (err) {
-        if (err instanceof SyntaxError) {
-          throw enrichSyntaxError(err, body, meta.name);
-        }
-        throw err;
-      }
+      // Uses new Function() for eager parsing — Bun's vm.Script defers parsing,
+      // so new vm.Script() would silently accept broken code.
+      const syntaxErr = validateSyntax(body, meta.name);
+      if (syntaxErr) throw syntaxErr;
 
       // Dry run: syntax already validated above, return metadata without executing
       if (params.dryRun) {
@@ -1346,5 +1376,5 @@ export default function registerExtension(pi: ExtensionAPI) {
 
 // ── Exports ───────────────────────────────────────────────────────────────
 
-export { executeWorkflow, parseScript, createWorkflowTool, createWorkflowStatusTool, enrichSyntaxError, suggestSyntaxFix, getRunStatus };
+export { executeWorkflow, parseScript, createWorkflowTool, createWorkflowStatusTool, enrichSyntaxError, suggestSyntaxFix, validateSyntax, getRunStatus };
 export type { WorkflowMeta, AgentOptions, WorkflowRunResult, JournalEntry };
