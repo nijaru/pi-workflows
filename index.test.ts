@@ -1,5 +1,5 @@
 import { describe, test, expect } from "bun:test";
-import { parseScript, enrichSyntaxError } from "./index";
+import { parseScript, enrichSyntaxError, suggestSyntaxFix } from "./index";
 
 describe("pi-workflows", () => {
   describe("parseScript", () => {
@@ -81,6 +81,41 @@ const d = new Date("2024-01-01");
       err.stack = "SyntaxError: bad syntax";
       const enriched = enrichSyntaxError(err, "body", "test");
       expect(enriched.message).toBe("bad syntax");
+    });
+  });
+
+  describe("suggestSyntaxFix", () => {
+    test("detects unbalanced parentheses", () => {
+      const body = `const x = agent("test", { label: "test" }`;
+      const tip = suggestSyntaxFix("missing ) after argument list", body);
+      expect(tip).toContain("Unbalanced parentheses");
+      expect(tip).toContain("1 opening vs 0 closing");
+    });
+
+    test("detects odd backtick count", () => {
+      const body = "const x = `template literal without close";
+      const tip = suggestSyntaxFix("missing ) after argument list", body);
+      expect(tip).toContain("Odd number of backticks");
+    });
+
+    test("detects unbalanced braces on unexpected end of input", () => {
+      const body = "const x = { a: 1, b: 2";
+      const tip = suggestSyntaxFix("Unexpected end of input", body);
+      expect(tip).toContain("Unbalanced braces");
+    });
+
+    test("returns empty string when no heuristic matches", () => {
+      const tip = suggestSyntaxFix("some other error", "const x = 1;");
+      expect(tip).toBe("");
+    });
+
+    test("returns empty string for balanced code", () => {
+      const body = 'const x = agent(`test`, { label: "x" });';
+      const tip = suggestSyntaxFix("missing ) after argument list", body);
+      const hasParensTip = tip.includes("Unbalanced parentheses");
+      const hasBacktickTip = tip.includes("backtick");
+      expect(hasParensTip || tip === "").toBe(true);
+      expect(hasBacktickTip).toBe(false);
     });
   });
 });

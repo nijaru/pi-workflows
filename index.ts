@@ -355,13 +355,47 @@ async function runAgent(
 // ── Workflow Runtime ───────────────────────────────────────────────────────
 
 /**
+ * Heuristically suggest a likely cause for common V8 syntax errors.
+ * Returns an empty string if no heuristic matches.
+ */
+function suggestSyntaxFix(message: string, body: string): string {
+  const tips: string[] = [];
+  if (/missing \) after argument list/i.test(message)) {
+    const openParens = (body.match(/\(/g) || []).length;
+    const closeParens = (body.match(/\)/g) || []).length;
+    if (openParens > closeParens) {
+      tips.push(`Unbalanced parentheses: ${openParens} opening vs ${closeParens} closing. Check agent() and parallel() calls for missing closing ")"`);
+    }
+    const backtickCount = (body.match(/`/g) || []).length;
+    if (backtickCount % 2 !== 0) {
+      tips.push(`Odd number of backticks (${backtickCount}): a template literal is missing its closing backtick`);
+    }
+  }
+  if (/unexpected end of input/i.test(message)) {
+    const openBraces = (body.match(/\{/g) || []).length;
+    const closeBraces = (body.match(/\}/g) || []).length;
+    if (openBraces > closeBraces) {
+      tips.push(`Unbalanced braces: ${openBraces} opening vs ${closeBraces} closing. Check for missing "}"`);
+    }
+    const openBrackets = (body.match(/\[/g) || []).length;
+    const closeBrackets = (body.match(/\]/g) || []).length;
+    if (openBrackets > closeBrackets) {
+      tips.push(`Unbalanced brackets: ${openBrackets} opening vs ${closeBrackets} closing. Check for missing "]"`);
+    }
+  }
+  return tips.length > 0 ? `\n\n  Likely cause: ${tips.join("; ")}` : "";
+}
+
+/**
  * Enrich a vm.Script SyntaxError with line:column context from the original script body.
  * V8 errors include `filename:line:col` in the stack trace — we offset by the prelude
  * lines to map back to the user's script.
  */
 function enrichSyntaxError(err: SyntaxError, body: string, filename = "workflow"): SyntaxError {
+  const originalMessage = err.message;
   const lines = body.split("\n");
   const lineMatch = err.stack?.match(/:(\d+):(\d+)/);
+  let enriched = originalMessage;
   if (lineMatch) {
     const rawLine = parseInt(lineMatch[1], 10);
     const col = parseInt(lineMatch[2], 10);
@@ -377,9 +411,11 @@ function enrichSyntaxError(err: SyntaxError, body: string, filename = "workflow"
           context.push(`         ${" ".repeat(col)}^`);
         }
       }
-      err.message = `${err.message}\n\n  at ${filename}.js:${scriptLine + 1}:${col}\n\n${context.join("\n")}`;
+      enriched = `${enriched}\n\n  at ${filename}.js:${scriptLine + 1}:${col}\n\n${context.join("\n")}`;
     }
   }
+  enriched += suggestSyntaxFix(originalMessage, body);
+  err.message = enriched;
   return err;
 }
 
@@ -771,6 +807,8 @@ function createWorkflowTool() {
       "Globals: agent(prompt, opts), parallel(fns), pipeline(items, ...stages), phase(title, {budget}), log(msg), args, budget, verify(), judgePanel(), loopUntilDry(), completenessCheck()",
       "Scripts have no direct filesystem or shell access. All side effects go through agent() calls.",
       "Date.now(), Math.random(), and new Date() without args are blocked. Explicit dates like new Date(\"2024-01-01\") and Date.UTC() are allowed.",
+      "CRITICAL: The script is compiled as a JS module body. Ensure every agent(), parallel(), and function call has balanced parentheses and braces. The most common failure is 'missing ) after argument list' from unbalanced parens in long agent() calls with multiline template literals.",
+      "Template literals (backticks) in agent() prompts must be closed. Count the backticks — if odd, one is missing. If the prompt contains backticks, escape them as \\` or use a regular string.",
       "Example: `export const meta = { name: \"review\", description: \"Review files\" }; const files = [\"a.ts\", \"b.ts\"]; await parallel(files.map(f => () => agent(\`Review ${f}\`, { label: f })));`",
     ],
 
@@ -819,17 +857,21 @@ function createWorkflowTool() {
 
       const { meta, body } = parseScript(script);
 
-      // Dry run: validate syntax and return metadata without executing
-      if (params.dryRun) {
-        const wrapped = `${DETERMINISM_PRELUDE}\n(async () => {\n${body}\n})()`;
-        try {
-          new vm.Script(wrapped, { filename: `${meta.name}.js` });
-        } catch (err) {
-          if (err instanceof SyntaxError) {
-            throw enrichSyntaxError(err, body, meta.name);
-          }
-          throw err;
+      // Validate syntax BEFORE any execution path.
+      // Catches syntax errors synchronously so the model gets an actionable
+      // error as the tool result instead of a background failure notification.
+      const wrapped = `${DETERMINISM_PRELUDE}\n(async () => {\n${body}\n})()`;
+      try {
+        new vm.Script(wrapped, { filename: `${meta.name}.js` });
+      } catch (err) {
+        if (err instanceof SyntaxError) {
+          throw enrichSyntaxError(err, body, meta.name);
         }
+        throw err;
+      }
+
+      // Dry run: syntax already validated above, return metadata without executing
+      if (params.dryRun) {
         return ok(
           `Workflow "${meta.name}": ${meta.description}${meta.phases ? `, ${meta.phases.length} phase(s)` : ""}. ` +
           `Script is valid and ready to run.` +
@@ -1304,5 +1346,5 @@ export default function registerExtension(pi: ExtensionAPI) {
 
 // ── Exports ───────────────────────────────────────────────────────────────
 
-export { executeWorkflow, parseScript, createWorkflowTool, createWorkflowStatusTool, enrichSyntaxError, getRunStatus };
+export { executeWorkflow, parseScript, createWorkflowTool, createWorkflowStatusTool, enrichSyntaxError, suggestSyntaxFix, getRunStatus };
 export type { WorkflowMeta, AgentOptions, WorkflowRunResult, JournalEntry };
