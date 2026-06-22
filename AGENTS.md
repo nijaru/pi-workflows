@@ -82,8 +82,10 @@ The VM sandbox exposes only: `agent`, `parallel`, `pipeline`, `log`, `phase`, `v
 - **Resume scanning:** `listWorkflowRuns()` scans by workflow name. Multiple incomplete runs for the same name is unlikely but possible — picks first match.
 - **Worktree merge:** Cherry-pick with `-X theirs` fallback, then `git merge` fallback. Conflicts are logged, not fatal.
 - **Determinism prelude:** `Date` constructor wrapper uses `new _D(...a)`, not `Reflect.construct`.
-- **Synchronous syntax validation:** `execute()` compiles the wrapped script with `vm.Script` before any execution path. Syntax errors throw immediately as the tool result (with line context + heuristic suggestions from `suggestSyntaxFix`) instead of failing asynchronously in the background.
+- **Synchronous syntax validation:** `execute()` eagerly validates via `validateSyntax()` (uses `new Function()`) before any execution path. Syntax errors throw immediately as the tool result with line context + heuristic suggestions. **Do NOT use `new vm.Script()` for validation** — Bun defers parsing, so it silently accepts broken code; the error surfaces at `runInContext()` time instead.
+- **Bun vm.Script deferred parsing:** `new vm.Script(code)` does NOT parse on Bun (JavaScriptCore). Parsing happens lazily at `runInContext()`. `runInContext` is wrapped in try/catch that enriches deferred parse errors as a fallback.
 - **Error enrichment:** `enrichSyntaxError()` maps V8 line:col back to the script body and appends `suggestSyntaxFix()` hints (unbalanced parens, odd backticks, unmatched braces/brackets).
+- **Prelude quoting:** The prelude is a single-quoted JS string that generates JS code. Nested quotes inside `new Error("...")` must use escaped single quotes (`\'...'`) or the double-quotes close the string early. This caused a latent syntax bug that produced recurring "missing ) after argument list" failures.
 
 ## Commands
 
