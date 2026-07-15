@@ -256,9 +256,14 @@ const value = 1 / Date.now();
             maxTokens: model.maxTokens,
           })),
         });
-        faux.setResponses([(_context, options) => new Promise((resolve) => {
-          options?.signal?.addEventListener("abort", () => resolve(fauxAssistantMessage("", { stopReason: "aborted" })), { once: true });
-        })]);
+        let markStarted!: () => void;
+        const started = new Promise<void>((resolve) => { markStarted = resolve; });
+        faux.setResponses([(_context, options) => {
+          markStarted();
+          return new Promise((resolve) => {
+            options?.signal?.addEventListener("abort", () => resolve(fauxAssistantMessage("", { stopReason: "aborted" })), { once: true });
+          });
+        }]);
         const defaultModel = modelRegistry.find("workflow-cancel-test", "worker");
         const script = `export const meta = { name: "cancel-sdk", description: "test" };\nreturn await agent("wait", { label: "leaf", effect: "read" });`;
         const run = executeWorkflow(script, {
@@ -268,7 +273,7 @@ const value = 1 / Date.now();
           tokenBudget: 100000,
           signal: controller.signal,
         });
-        await new Promise((resolve) => setTimeout(resolve, 50));
+        await started;
         controller.abort();
         await expect(run).rejects.toThrow("Workflow aborted");
         expect(faux.state.callCount).toBe(1);
