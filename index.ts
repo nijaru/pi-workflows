@@ -1338,22 +1338,51 @@ async function runSdkWorker(
       model,
     }));
   } catch (error) {
-    if (options.signal?.aborted) throw new WorkflowControlError("aborted", "Workflow aborted");
+    if (options.signal?.aborted) {
+      if (session) {
+        try {
+          await session.abort();
+        } catch {
+          // Preserve the workflow cancellation error even if SDK cleanup fails.
+        } finally {
+          session.dispose();
+        }
+      }
+      throw new WorkflowControlError("aborted", "Workflow aborted");
+    }
     throw error;
   }
 
   let removeAbortListener: (() => void) | undefined;
-  const onAbort = () => session.abort();
+  let abortPromise: Promise<void> | undefined;
+  const abortSession = (): Promise<void> => {
+    if (abortPromise) return abortPromise;
+    abortPromise = session.abort() as Promise<void>;
+    return abortPromise;
+  };
+  const onAbort = () => {
+    // Abort is async: retain the promise so the prompt cannot race disposal,
+    // and consume a rejection here because the prompt path reports the error.
+    void abortSession().catch(() => {});
+  };
   if (options.signal) {
-    if (options.signal.aborted) session.abort();
-    else {
-      options.signal.addEventListener("abort", onAbort, { once: true });
-      removeAbortListener = () => options.signal?.removeEventListener("abort", onAbort);
-    }
+    options.signal.addEventListener("abort", onAbort, { once: true });
+    removeAbortListener = () => options.signal?.removeEventListener("abort", onAbort);
   }
 
   try {
+    // The synchronous check closes the cancellation window immediately before
+    // prompt() starts. Abort events cannot interleave this JavaScript stack.
+    if (options.signal?.aborted) {
+      try {
+        await abortSession();
+      } catch {
+        // Preserve the workflow cancellation error even if SDK cleanup fails.
+      }
+      throw new WorkflowControlError("aborted", "Workflow aborted");
+    }
     await session.prompt(`Task: ${options.label}\n\n${prompt}`);
+    if (options.signal?.aborted) throw new WorkflowControlError("aborted", "Workflow aborted");
     const failure = getAssistantFailure(session.messages);
     if (failure) {
       if (options.signal?.aborted || failure.includes("aborted")) {
@@ -1383,6 +1412,7 @@ async function runSdkWorker(
     throw error;
   } finally {
     removeAbortListener?.();
+    if (abortPromise) await abortPromise.catch(() => {});
     session.dispose();
   }
 }

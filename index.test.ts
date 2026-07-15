@@ -1,4 +1,6 @@
 import { describe, test, expect } from "bun:test";
+import { fauxAssistantMessage, fauxProvider } from "@earendil-works/pi-ai/providers/faux";
+import { AuthStorage, ModelRegistry } from "@earendil-works/pi-coding-agent";
 import { execFileSync } from "node:child_process";
 import { mkdtempSync, mkdirSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
@@ -179,6 +181,99 @@ const value = 1 / Date.now();
         expect(meta.executionPolicy.workerBackend).toBe("test-worker");
         expect(meta.executionPolicy.workspaceIdentity).toMatch(/^path:/);
       } finally {
+        rmSync(cwd, { recursive: true, force: true });
+      }
+    });
+
+    test("runs the default SDK worker with an in-memory faux provider", async () => {
+      const cwd = mkdtempSync(join(tmpdir(), "pi-workflows-test-"));
+      try {
+        const faux = fauxProvider({
+          provider: "workflow-test",
+          models: [{ id: "worker", name: "Workflow test", maxTokens: 4096 }],
+        });
+        const authStorage = AuthStorage.inMemory();
+        const modelRegistry = ModelRegistry.inMemory(authStorage);
+        modelRegistry.registerProvider("workflow-test", {
+          api: faux.api as any,
+          apiKey: "test-only",
+          baseUrl: "http://localhost:0",
+          streamSimple: faux.provider.streamSimple,
+          models: faux.models.map((model) => ({
+            id: model.id,
+            name: model.name,
+            api: faux.api as any,
+            baseUrl: "http://localhost:0",
+            reasoning: model.reasoning,
+            input: model.input,
+            cost: model.cost,
+            contextWindow: model.contextWindow,
+            maxTokens: model.maxTokens,
+          })),
+        });
+        faux.setResponses([fauxAssistantMessage("default sdk worker response")]);
+        const defaultModel = modelRegistry.find("workflow-test", "worker");
+        expect(defaultModel).toBeDefined();
+        const script = `export const meta = { name: "default-sdk", description: "test" };\nreturn await agent("inspect", { label: "leaf", effect: "read" });`;
+        const result = await executeWorkflow(script, {
+          cwd,
+          runId: "run-default-sdk",
+          runtime: { authStorage, modelRegistry, defaultModel },
+          tokenBudget: 100000,
+        });
+        expect(result.result).toBe("default sdk worker response");
+        expect(faux.state.callCount).toBe(1);
+        expect(result.tokenUsage.total).toBeGreaterThan(0);
+      } finally {
+        rmSync(cwd, { recursive: true, force: true });
+      }
+    });
+
+    test("awaits SDK cancellation while a default worker is in flight", async () => {
+      const cwd = mkdtempSync(join(tmpdir(), "pi-workflows-test-"));
+      const controller = new AbortController();
+      try {
+        const faux = fauxProvider({
+          provider: "workflow-cancel-test",
+          models: [{ id: "worker", name: "Workflow cancellation test", maxTokens: 4096 }],
+        });
+        const authStorage = AuthStorage.inMemory();
+        const modelRegistry = ModelRegistry.inMemory(authStorage);
+        modelRegistry.registerProvider("workflow-cancel-test", {
+          api: faux.api as any,
+          apiKey: "test-only",
+          baseUrl: "http://localhost:0",
+          streamSimple: faux.provider.streamSimple,
+          models: faux.models.map((model) => ({
+            id: model.id,
+            name: model.name,
+            api: faux.api as any,
+            baseUrl: "http://localhost:0",
+            reasoning: model.reasoning,
+            input: model.input,
+            cost: model.cost,
+            contextWindow: model.contextWindow,
+            maxTokens: model.maxTokens,
+          })),
+        });
+        faux.setResponses([(_context, options) => new Promise((resolve) => {
+          options?.signal?.addEventListener("abort", () => resolve(fauxAssistantMessage("", { stopReason: "aborted" })), { once: true });
+        })]);
+        const defaultModel = modelRegistry.find("workflow-cancel-test", "worker");
+        const script = `export const meta = { name: "cancel-sdk", description: "test" };\nreturn await agent("wait", { label: "leaf", effect: "read" });`;
+        const run = executeWorkflow(script, {
+          cwd,
+          runId: "run-cancel-sdk",
+          runtime: { authStorage, modelRegistry, defaultModel },
+          tokenBudget: 100000,
+          signal: controller.signal,
+        });
+        await new Promise((resolve) => setTimeout(resolve, 50));
+        controller.abort();
+        await expect(run).rejects.toThrow("Workflow aborted");
+        expect(faux.state.callCount).toBe(1);
+      } finally {
+        controller.abort();
         rmSync(cwd, { recursive: true, force: true });
       }
     });
