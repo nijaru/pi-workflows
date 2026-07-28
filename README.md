@@ -58,9 +58,9 @@ Workflows run in the background by default. The tool returns a `runId`; use `wor
 | Parallelism | `parallel()` and `pipeline()` drain all siblings before propagating a failure. Maximum 8 active child sessions and 100 calls/items. |
 | Budgets | `tokenBudget` is an admission/output allowance with conservative reservations and post-call reconciliation. Provider input/system tokens can vary, so it is a safety ceiling, not an exact billing quote. |
 | Resume | Results are reused only when script, args, execution policy, active model/thinking identity, research backend, Git state, and dirty-file contents match. Resume is at-least-once around external side effects. |
-| State | Checkpoints live under `.pi/workflows/<runId>/` with restrictive permissions, atomic metadata/results and marker files, append-only journals, and a filesystem lock. Background execution itself lives in the Pi process; restart requires explicit resume. |
+| State | Checkpoints live under `.pi/workflows/<runId>/` with restrictive permissions, atomic metadata/results and marker files, append-only journals, a durable per-attempt usage ledger, and a filesystem lock. Worktree merges publish a pending-merge marker before Git effects so restart can reconcile the commit. Background execution itself lives in the Pi process; restart requires explicit resume. |
 | Failure states | Runs are `completed`, `error`, `paused`, `cancelled`, `orphaned`, or `running`; status includes per-agent progress and token usage. An orphaned run had a dead coordinator and can be explicitly resumed. |
-| Isolation | `isolation: "worktree"` fails closed, preserves the caller's subdirectory, ignores workflow-managed `.pi` state when checking for user changes, and refuses dirty-main merges or conflicts. A Git worktree is not an OS security boundary. |
+| Isolation | `isolation: "worktree"` fails closed, preserves the caller's subdirectory, ignores workflow-managed `.pi` state when checking for user changes, refuses dirty-main merges or conflicts, and removes clean failed worktrees while preserving changed/conflicted ones. A Git worktree is not an OS security boundary. |
 | Sandbox | Workflow code runs in a null-prototype VM with string/wasm code generation disabled and host capabilities bridged through JSON-safe values. Treat workflows as trusted plans; use OS/container isolation for hostile code. |
 | Limits | Scripts are capped at 512 KiB, synchronous VM segments at 30 minutes, quality helpers are bounded, and research is capped at 32 calls/4 concurrent requests/32 KiB request/1 MiB result/60 seconds. |
 
@@ -75,7 +75,7 @@ The VM is intentionally a small capability surface: `agent`, `parallel`, `pipeli
 | `/workflows run <name>` | Run a saved workflow in the background. |
 | `/workflows pause <runId>` | Pause at the next workflow/agent boundary. |
 | `/workflows resume <runId>` | Resume a paused or failed run using its persisted script, args, and policy. |
-| `/workflows clean [days]` | Remove old completed, failed, or cancelled runs; paused/running/orphaned runs are preserved. |
+| `/workflows clean [days]` | Remove old completed, failed, or cancelled runs; cleanup claims each run lock and preserves live, pending-merge, or changed worktree state. Paused/running/orphaned runs are preserved. |
 
 Tools:
 

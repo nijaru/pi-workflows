@@ -86,6 +86,9 @@ The VM sandbox exposes only: `agent`, `parallel`, `pipeline`, `research`, `log`,
 - **Abort handling:** Background catch checks `signal?.aborted || error === "Workflow aborted"` — abort is deliberate cancellation, not failure. No `error.log` written, notifies as info.
 - **Cost reporting:** Default `stats.cost` to `0` for free models. Budget is token-based (unaffected).
 - **Resume scanning:** `listWorkflowRuns()` scans by workflow name. Multiple incomplete runs for the same name is unlikely but possible — picks first match. Fingerprints include dirty-file contents, not only Git status text.
+- **Attempt accounting:** `attempts.jsonl` is the durable source for every worker attempt, including failed/cancelled/invalid attempts; resume seeds budgets from it and uses journals only as a legacy fallback.
+- **Worktree recovery:** `pending-merge.json` is written before the worktree commit and updated after commit. Resume reconciles a committed worktree if the process dies before cherry-pick or journaling; cleanup must preserve pending markers.
+- **Research timeout:** the hard timeout starts before research limiter admission, so queued requests cannot begin after their deadline; late non-cooperative backends are observed and ignored.
 - **Canonical mutation coordination:** workflow locks and host `tool_call` guards prevent Pi edit/write races; worktree merges remain serialized and fail closed on dirty/conflicting main checkouts.
 - **Determinism prelude:** `Date` constructor wrapper uses `new _D(...a)`, not `Reflect.construct`.
 - **Synchronous syntax validation:** `execute()` eagerly validates via `validateSyntax()` (uses `new Function()`) before any execution path. Syntax errors throw immediately as the tool result with line context + heuristic suggestions. **Do NOT use `new vm.Script()` for validation** — Bun defers parsing, so it silently accepts broken code; the error surfaces at `runInContext()` time instead.

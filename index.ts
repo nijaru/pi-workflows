@@ -38,7 +38,7 @@ import {
   writeSync,
   constants as fsConstants,
 } from "node:fs";
-import { isAbsolute, join, relative, resolve, sep } from "node:path";
+import { dirname, isAbsolute, join, relative, resolve, sep } from "node:path";
 import vm from "node:vm";
 
 // ── Types ──────────────────────────────────────────────────────────────────
@@ -102,6 +102,11 @@ export interface ResearchBackend {
 }
 
 interface WorkflowRuntime {
+  /** Test-only fault injection hooks; absent in production hosts. */
+  testHooks?: {
+    afterWorktreeCommit?: () => void;
+    afterWorktreeCherryPick?: () => void;
+  };
   /** Pi 0.82+ canonical runtime. */
   modelRuntime?: any;
   /** Compatibility inputs for pre-0.82 Pi hosts and tests. */
@@ -132,6 +137,27 @@ interface WorkerResult {
   tokens: { input: number; output: number; total: number; cost: number };
   model?: string;
   stopReason?: string;
+}
+
+type TokenUsage = WorkerResult["tokens"];
+
+class WorkerExecutionError extends Error {
+  constructor(
+    message: string,
+    readonly tokens?: TokenUsage,
+    readonly control?: "aborted" | "cancelled",
+  ) {
+    super(message);
+    this.name = "WorkerExecutionError";
+  }
+}
+
+function workerErrorUsage(error: unknown): TokenUsage | undefined {
+  if (error instanceof WorkerExecutionError) return error.tokens;
+  if (error && typeof error === "object" && (error as any).tokens !== undefined) {
+    try { return validateTokenUsage((error as any).tokens, "worker error"); } catch {}
+  }
+  return undefined;
 }
 
 function validateTokenUsage(value: unknown, source: string): WorkerResult["tokens"] {
@@ -169,6 +195,8 @@ interface ExecuteWorkflowOptions {
   runtime?: WorkflowRuntime;
   /** Explicit bounded host research capability for direct SDK callers. */
   researchBackend?: ResearchBackend;
+  /** Override only for bounded host/test callers; never exceeds the runtime cap. */
+  researchTimeoutMs?: number;
   timeoutMs?: number;
   lock?: boolean;
 }
@@ -199,6 +227,9 @@ function encodeWorkflowError(error: unknown): string {
 
 function decodeWorkflowControl(error: unknown): WorkflowControlError | undefined {
   if (error instanceof WorkflowControlError) return error;
+  if (error instanceof WorkerExecutionError && error.control) {
+    return new WorkflowControlError(error.control, error.message);
+  }
   const message = error instanceof Error
     ? error.message
     : (error && typeof error === "object" && typeof (error as any).message === "string" ? (error as any).message : String(error));
@@ -209,6 +240,13 @@ function decodeWorkflowControl(error: unknown): WorkflowControlError | undefined
   const code = rest.slice(0, split);
   if (code !== "paused" && code !== "aborted" && code !== "cancelled") return undefined;
   return new WorkflowControlError(code, rest.slice(split + 1));
+}
+
+class ResearchTimeoutError extends Error {
+  constructor() {
+    super("Research request timed out");
+    this.name = "ResearchTimeoutError";
+  }
 }
 
 class WorkflowAgentError extends Error {
@@ -222,8 +260,28 @@ interface JournalEntry {
   index: number;
   hash: string;
   result: unknown;
-  tokens: { input: number; output: number; total: number; cost: number };
+  tokens: TokenUsage;
   durationMs: number;
+}
+
+interface AttemptLedgerEntry {
+  attemptId: string;
+  index: number;
+  attempt: number;
+  phase?: string;
+  status: "completed" | "invalid" | "failed" | "cancelled";
+  tokens: TokenUsage;
+}
+
+interface PendingMerge {
+  index: number;
+  hash: string;
+  label: string;
+  phase?: string;
+  baseHead: string;
+  worktreePath: string;
+  commitHash: string;
+  journal: JournalEntry;
 }
 
 interface WorkflowRunResult {
@@ -260,6 +318,8 @@ const MAX_RESEARCH_CONCURRENCY = 4;
 const MAX_RESEARCH_REQUEST_BYTES = 32 * 1024;
 const MAX_RESEARCH_RESULT_BYTES = 1024 * 1024;
 const MAX_RESEARCH_TIMEOUT_MS = 60 * 1000;
+const ATTEMPTS_FILE = "attempts.jsonl";
+const PENDING_MERGE_FILE = "pending-merge.json";
 const ESTIMATED_SYSTEM_TOKENS = 2048;
 const SDK_WORKER_TOOLS = ["read", "bash", "edit", "write"] as const;
 const SDK_READ_ONLY_WORKER_TOOLS = ["read", "grep", "find", "ls"] as const;
@@ -1060,6 +1120,106 @@ function readJournal(cwd: string, runId: string): Map<number, JournalEntry> {
   return journal;
 }
 
+function emptyTokenUsage(): TokenUsage {
+  return { input: 0, output: 0, total: 0, cost: 0 };
+}
+
+function addTokenUsage(target: TokenUsage, usage: TokenUsage): void {
+  target.input += usage.input;
+  target.output += usage.output;
+  target.total += usage.total;
+  target.cost += usage.cost;
+}
+
+function writeAttemptLedger(cwd: string, runId: string, entry: AttemptLedgerEntry): void {
+  appendRunLine(cwd, runId, ATTEMPTS_FILE, entry);
+}
+
+function readAttemptLedger(cwd: string, runId: string): {
+  entries: Map<string, AttemptLedgerEntry>;
+  usage: TokenUsage;
+  callIndices: Set<number>;
+  phaseUsage: Map<string, number>;
+} {
+  const entries = new Map<string, AttemptLedgerEntry>();
+  const path = join(getJournalDir(cwd, runId), ATTEMPTS_FILE);
+  if (!isRegularFile(path)) return { entries, usage: emptyTokenUsage(), callIndices: new Set(), phaseUsage: new Map() };
+  for (const line of readRegularFile(path).split("\n")) {
+    if (!line.trim()) continue;
+    try {
+      const raw = JSON.parse(line) as Record<string, unknown>;
+      if (typeof raw.attemptId !== "string" || !Number.isInteger(raw.index) || (raw.index as number) < 0 || !Number.isInteger(raw.attempt) || (raw.attempt as number) < 0) continue;
+      if (raw.status !== "completed" && raw.status !== "invalid" && raw.status !== "failed" && raw.status !== "cancelled") continue;
+      const tokens = validateTokenUsage(raw.tokens, `attempt ${raw.attemptId}`);
+      entries.set(raw.attemptId, {
+        attemptId: raw.attemptId,
+        index: raw.index as number,
+        attempt: raw.attempt as number,
+        ...(typeof raw.phase === "string" ? { phase: raw.phase } : {}),
+        status: raw.status,
+        tokens,
+      });
+    } catch {
+      // A truncated final append is safe to ignore; completed attempts are
+      // published atomically as complete JSONL records.
+    }
+  }
+  const usage = emptyTokenUsage();
+  const callIndices = new Set<number>();
+  const phaseUsage = new Map<string, number>();
+  for (const entry of entries.values()) {
+    addTokenUsage(usage, entry.tokens);
+    callIndices.add(entry.index);
+    if (entry.phase) phaseUsage.set(entry.phase, (phaseUsage.get(entry.phase) ?? 0) + entry.tokens.total);
+  }
+  return { entries, usage, callIndices, phaseUsage };
+}
+
+function readDurableUsage(cwd: string, runId: string, resumeJournal?: Map<number, JournalEntry>): {
+  usage: TokenUsage;
+  phaseUsage: Map<string, number>;
+} {
+  const ledger = readAttemptLedger(cwd, runId);
+  const usage = { ...ledger.usage };
+  const phaseUsage = new Map(ledger.phaseUsage);
+  const journal = resumeJournal ?? readJournal(cwd, runId);
+  // Runs created before attempts.jsonl existed are upgraded from successful
+  // journal entries. Current runs always have an attempt record for each call.
+  const legacyIndices = new Set<number>();
+  for (const entry of journal.values()) {
+    if (ledger.callIndices.has(entry.index)) continue;
+    legacyIndices.add(entry.index);
+    addTokenUsage(usage, entry.tokens);
+  }
+  if (legacyIndices.size > 0) {
+    const eventsPath = join(getJournalDir(cwd, runId), "events.jsonl");
+    if (isRegularFile(eventsPath)) {
+      const phaseIndices = new Set<number>();
+      for (const line of readRegularFile(eventsPath).split("\n")) {
+        try {
+          const event = JSON.parse(line) as Record<string, unknown>;
+          if (event.type !== "completed" || !Number.isInteger(event.index) || !legacyIndices.has(event.index as number) || phaseIndices.has(event.index as number) || typeof event.phase !== "string" || !event.usage) continue;
+          const eventUsage = validateTokenUsage(event.usage, `legacy event ${event.index}`);
+          phaseIndices.add(event.index as number);
+          phaseUsage.set(event.phase, (phaseUsage.get(event.phase) ?? 0) + eventUsage.total);
+        } catch {}
+      }
+    }
+  }
+  return { usage, phaseUsage };
+}
+
+function readPendingMerge(cwd: string, runId: string): PendingMerge | undefined {
+  const path = join(getJournalDir(cwd, runId), PENDING_MERGE_FILE);
+  if (!isRegularFile(path)) return undefined;
+  const value = JSON.parse(readRegularFile(path)) as PendingMerge;
+  if (!value || !Number.isInteger(value.index) || typeof value.hash !== "string" || typeof value.label !== "string" || typeof value.baseHead !== "string" || typeof value.worktreePath !== "string" || typeof value.commitHash !== "string" || !value.journal) {
+    throw new Error("Invalid pending workflow merge state");
+  }
+  validateTokenUsage(value.journal.tokens, "pending workflow merge");
+  return value;
+}
+
 // ── Concurrency Limiter ───────────────────────────────────────────────────
 
 async function withWorkspaceMergeLock<T>(cwd: string, fn: () => Promise<T>, key = workspaceLockKey(cwd)): Promise<T> {
@@ -1074,6 +1234,85 @@ async function withWorkspaceMergeLock<T>(cwd: string, fn: () => Promise<T>, key 
     release();
     if (WORKSPACE_MERGE_QUEUES.get(key) === current) WORKSPACE_MERGE_QUEUES.delete(key);
   }
+}
+
+function commitIsApplied(cwd: string, commitHash: string, baseHead?: string): boolean {
+  try {
+    execFileSync("git", ["merge-base", "--is-ancestor", commitHash, "HEAD"], { cwd, stdio: "ignore" });
+    return true;
+  } catch {
+    // A cherry-pick changes the commit ID. During the crash window, recognize
+    // the resulting HEAD by its parent and tree before replaying the change.
+    if (!baseHead) return false;
+    try {
+      const quiet = { cwd, encoding: "utf8" as const, stdio: ["ignore", "pipe", "ignore"] as any };
+      const parent = execFileSync("git", ["rev-parse", "HEAD^"], quiet).trim();
+      const headTree = execFileSync("git", ["rev-parse", "HEAD^{tree}"], quiet).trim();
+      const pendingTree = execFileSync("git", ["rev-parse", `${commitHash}^{tree}`], quiet).trim();
+      return parent === baseHead && headTree === pendingTree;
+    } catch {
+      return false;
+    }
+  }
+}
+
+async function reconcilePendingMerge(cwd: string, runId: string): Promise<boolean> {
+  const pending = readPendingMerge(cwd, runId);
+  if (!pending) return false;
+  const worktreesRoot = resolve(cwd, ".pi/worktrees");
+  const worktreePath = resolve(pending.worktreePath);
+  if (worktreePath !== worktreesRoot && !worktreePath.startsWith(`${worktreesRoot}${sep}`)) {
+    throw new Error("Pending workflow merge points outside the workflow worktree directory");
+  }
+  await withWorkspaceMergeLock(cwd, () => withWorkspaceMutationLock(cwd, async () => {
+    const journal = readJournal(cwd, runId);
+    const recorded = journal.get(pending.index);
+    if (recorded && recorded.hash !== pending.hash) throw new Error(`Pending workflow merge conflicts with journal entry ${pending.index}`);
+    let commitHash = pending.commitHash;
+    if (!commitHash) {
+      try {
+        const worktreeHead = execFileSync("git", ["rev-parse", "HEAD"], { cwd: worktreePath, encoding: "utf8" }).trim();
+        const worktreeParent = execFileSync("git", ["rev-parse", "HEAD^"], { cwd: worktreePath, encoding: "utf8" }).trim();
+        const worktreeStatus = execFileSync("git", ["status", "--porcelain"], { cwd: worktreePath, encoding: "utf8" }).trim();
+        if (worktreeParent !== pending.baseHead || worktreeStatus) throw new Error("pending worktree merge is incomplete; preserved for manual recovery");
+        commitHash = worktreeHead;
+        writeRunJson(cwd, runId, PENDING_MERGE_FILE, { ...pending, commitHash });
+      } catch (error) {
+        throw error instanceof Error ? error : new Error(String(error));
+      }
+    }
+    const root = workspaceLockKey(cwd);
+    if (!commitIsApplied(cwd, commitHash, pending.baseHead)) {
+      const head = execFileSync("git", ["rev-parse", "HEAD"], { cwd, encoding: "utf8" }).trim();
+      if (head !== pending.baseHead) {
+        throw new Error(`Pending workflow merge requires manual recovery; checkout advanced from ${pending.baseHead}`);
+      }
+      const mainStatus = execFileSync("git", ["status", "--porcelain=v1", "--untracked-files=all"], { cwd: root, encoding: "utf8" });
+      if (filterWorkflowManagedGitStatus(mainStatus, cwd, root)) {
+        throw new Error("main checkout has uncommitted changes; pending worktree merge refused");
+      }
+      try {
+        execFileSync("git", ["cherry-pick", commitHash, "--no-edit"], { cwd, stdio: "ignore" });
+      } catch {
+        try { execFileSync("git", ["cherry-pick", "--abort"], { cwd, stdio: "ignore" }); } catch {}
+        throw new Error(`pending worktree merge conflict for "${pending.label}"; preserved at ${pending.worktreePath}`);
+      }
+    }
+    if (!recorded) {
+      writeJournalEntry(cwd, runId, pending.journal);
+      writeRunEvent(cwd, runId, {
+        type: "completed",
+        index: pending.index,
+        label: pending.label,
+        phase: pending.phase,
+        usage: pending.journal.tokens,
+        reconciled: true,
+      });
+    }
+    removeRunMarker(cwd, runId, PENDING_MERGE_FILE);
+    try { execFileSync("git", ["worktree", "remove", pending.worktreePath, "--force"], { cwd, stdio: "ignore" }); } catch {}
+  }), workspaceLockKey(cwd));
+  return true;
 }
 
 function createLimiter(limit: number) {
@@ -1414,6 +1653,21 @@ function getAuthAndRegistry(agentDir: string): Promise<{ auth?: any; registry?: 
   return fallback;
 }
 
+function readSessionTokenUsage(session: any): TokenUsage | undefined {
+  try {
+    const stats = session.getSessionStats();
+    const cost = Number.isFinite(stats.cost) ? stats.cost : 0;
+    return validateTokenUsage({
+      input: stats.tokens?.input,
+      output: stats.tokens?.output,
+      total: stats.tokens?.total,
+      cost,
+    }, "Pi SDK session");
+  } catch {
+    return undefined;
+  }
+}
+
 async function runSdkWorker(
   options: WorkerRequest,
 ): Promise<WorkerResult> {
@@ -1485,6 +1739,7 @@ async function runSdkWorker(
     else Object.assign(sessionOptions, { authStorage, modelRegistry: registry });
     ({ session } = await sdk.createAgentSession(sessionOptions));
   } catch (error) {
+    const tokens = session ? readSessionTokenUsage(session) : undefined;
     if (options.signal?.aborted) {
       if (session) {
         try {
@@ -1495,8 +1750,9 @@ async function runSdkWorker(
           session.dispose();
         }
       }
-      throw new WorkflowControlError("aborted", "Workflow aborted");
+      throw new WorkerExecutionError("Workflow aborted", tokens, "aborted");
     }
+    if (tokens) throw new WorkerExecutionError(error instanceof Error ? error.message : String(error), tokens);
     throw error;
   }
 
@@ -1555,7 +1811,11 @@ async function runSdkWorker(
       stopReason: finalAssistant?.stopReason,
     };
   } catch (error) {
-    if (options.signal?.aborted) throw new WorkflowControlError("aborted", "Workflow aborted");
+    const tokens = readSessionTokenUsage(session);
+    if (options.signal?.aborted) throw new WorkerExecutionError("Workflow aborted", tokens, "aborted");
+    if (tokens && !(error instanceof WorkerExecutionError)) {
+      throw new WorkerExecutionError(error instanceof Error ? error.message : String(error), tokens);
+    }
     throw error;
   } finally {
     removeAbortListener?.();
@@ -1684,6 +1944,9 @@ async function executeWorkflowCore(
   const timeoutInput = options.timeoutMs == null ? MAX_WORKFLOW_TIMEOUT_MS : finiteNonNegative(options.timeoutMs, "timeoutMs")!;
   if (timeoutInput <= 0) throw new Error("timeoutMs must be greater than zero");
   const timeoutMs = Math.min(MAX_WORKFLOW_TIMEOUT_MS, Math.max(1, Math.floor(timeoutInput)));
+  const researchTimeoutInput = options.researchTimeoutMs == null ? MAX_RESEARCH_TIMEOUT_MS : finiteNonNegative(options.researchTimeoutMs, "researchTimeoutMs")!;
+  if (researchTimeoutInput <= 0) throw new Error("researchTimeoutMs must be greater than zero");
+  const researchTimeoutMs = Math.min(MAX_RESEARCH_TIMEOUT_MS, Math.max(1, Math.floor(researchTimeoutInput)));
 
   const state = {
     logs: [] as string[],
@@ -1693,19 +1956,23 @@ async function executeWorkflowCore(
     firstMiss: Number.POSITIVE_INFINITY,
   };
 
+  const durableUsage = readDurableUsage(cwd, runId, options.resumeJournal);
   const shared = {
     limiter: createLimiter(MAX_CONCURRENCY),
     mergeLimiter: createLimiter(1),
     agentCount: 0,
-    spent: 0,
+    spent: durableUsage.usage.total,
     reserved: 0,
-    phaseUsage: new Map<string, number>(),
+    phaseUsage: durableUsage.phaseUsage,
     phaseReserved: new Map<string, number>(),
-    tokenUsage: { input: 0, output: 0, total: 0, cost: 0 },
+    tokenUsage: durableUsage.usage,
     activeCanonicalWrites: 0,
     researchLimiter: createLimiter(MAX_RESEARCH_CONCURRENCY),
     researchCount: 0,
   };
+  if (tokenBudget != null && shared.spent > tokenBudget) {
+    throw new Error(`Token budget already exceeded by durable attempts (${shared.spent}/${tokenBudget})`);
+  }
 
   // Per-phase sub-budgets: phase title -> consumed usage and reservation.
   const phaseBudgets = new Map<string, { budget: number; warned: boolean }>();
@@ -1803,21 +2070,13 @@ async function executeWorkflowCore(
     const cached = options.resumeJournal?.get(callIndex);
 
     if (cached?.hash === callHash && callIndex < state.firstMiss) {
-      const cachedUsage = validateTokenUsage(cached.tokens, `cached agent ${callIndex}`);
-      const cachedTokens = cachedUsage.total;
-      if (tokenBudget != null && shared.spent + cachedTokens > tokenBudget) {
+      validateTokenUsage(cached.tokens, `cached agent ${callIndex}`);
+      if (tokenBudget != null && shared.spent > tokenBudget) {
         throw new Error("Cached workflow results exceed the requested token budget");
       }
-      shared.tokenUsage.input += cachedUsage.input;
-      shared.tokenUsage.output += cachedUsage.output;
-      shared.tokenUsage.total += cachedTokens;
-      shared.tokenUsage.cost += cachedUsage.cost;
-      shared.spent += cachedTokens;
-      notifyExecutionUsage(options.runtime, cachedUsage);
-      if (assignedPhase) shared.phaseUsage.set(assignedPhase, (shared.phaseUsage.get(assignedPhase) ?? 0) + cachedTokens);
       const cachedPhaseBudget = assignedPhase ? phaseBudgets.get(assignedPhase) : undefined;
       if (cachedPhaseBudget && (shared.phaseUsage.get(assignedPhase!) ?? 0) > cachedPhaseBudget.budget) throw new Error(`Cached results exceed phase "${assignedPhase}" budget`);
-      writeRunEvent(cwd, runId, { type: "cached", index: callIndex, label, phase: assignedPhase, tokens: cachedTokens });
+      writeRunEvent(cwd, runId, { type: "cached", index: callIndex, label, phase: assignedPhase, tokens: cached.tokens.total });
       update(`workflow ${runId}: resumed agent ${label}`);
       return cached.result;
     }
@@ -1872,40 +2131,51 @@ async function executeWorkflowCore(
         let resultValue: unknown;
         let completed = false;
         let lastStructuredError = "structured output did not match the requested schema";
-        for (let attempt = 0; attempt < attempts; attempt++) {
-          throwIfAborted();
-          const retryPrompt = attempt === 0 ? workerPrompt : `${workerPrompt}\n\nPrevious response failed validation: ${lastStructuredError}. Return a corrected JSON value only.`;
-          const workerResult = await worker.run({
-            prompt: retryPrompt,
-            label,
-            model,
-            cwd: agentCwd,
-            signal: options.signal,
-            runtime: options.runtime,
-            maxOutputTokens,
-            tools: effect === "read" ? [...SDK_READ_ONLY_WORKER_TOOLS] : [...SDK_WORKER_TOOLS],
-          });
-          if (Buffer.byteLength(workerResult.text, "utf8") > MAX_AGENT_RESULT_BYTES) throw new Error(`agent output exceeds ${MAX_AGENT_RESULT_BYTES} bytes`);
-          throwIfAborted();
-
-          const tokens = validateTokenUsage(workerResult.tokens, `worker ${label}`);
-          callUsage = {
-            input: callUsage.input + tokens.input,
-            output: callUsage.output + tokens.output,
-            total: callUsage.total + tokens.total,
-            cost: callUsage.cost + tokens.cost,
-          };
-          shared.tokenUsage.input += tokens.input;
-          shared.tokenUsage.output += tokens.output;
-          shared.tokenUsage.total += tokens.total;
-          shared.tokenUsage.cost += tokens.cost;
+        const recordAttempt = (attemptId: string, attempt: number, status: AttemptLedgerEntry["status"], tokens: TokenUsage) => {
+          writeAttemptLedger(cwd, runId, { attemptId, index: callIndex, attempt, phase: assignedPhase, status, tokens });
+          addTokenUsage(callUsage, tokens);
+          addTokenUsage(shared.tokenUsage, tokens);
           shared.spent += tokens.total;
           notifyExecutionUsage(options.runtime, tokens);
           if (assignedPhase) shared.phaseUsage.set(assignedPhase, (shared.phaseUsage.get(assignedPhase) ?? 0) + tokens.total);
           if (tokenBudget != null && shared.spent > tokenBudget) throw new Error(`Token budget exceeded (${shared.spent}/${tokenBudget})`);
           if (pb && (shared.phaseUsage.get(assignedPhase!) ?? 0) > pb.budget) throw new Error(`Phase "${assignedPhase}" budget exceeded (${pb.budget})`);
+        };
+        for (let attempt = 0; attempt < attempts; attempt++) {
+          throwIfAborted();
+          const attemptId = randomUUID();
+          const retryPrompt = attempt === 0 ? workerPrompt : `${workerPrompt}\n\nPrevious response failed validation: ${lastStructuredError}. Return a corrected JSON value only.`;
+          let workerResult: WorkerResult;
+          try {
+            workerResult = await worker.run({
+              prompt: retryPrompt,
+              label,
+              model,
+              cwd: agentCwd,
+              signal: options.signal,
+              runtime: options.runtime,
+              maxOutputTokens,
+              tools: effect === "read" ? [...SDK_READ_ONLY_WORKER_TOOLS] : [...SDK_WORKER_TOOLS],
+            });
+          } catch (error) {
+            const control = decodeWorkflowControl(error);
+            recordAttempt(attemptId, attempt, control ? "cancelled" : "failed", workerErrorUsage(error) ?? emptyTokenUsage());
+            throw error;
+          }
+          let tokens: TokenUsage;
+          try {
+            tokens = validateTokenUsage(workerResult.tokens, `worker ${label}`);
+          } catch (error) {
+            recordAttempt(attemptId, attempt, "failed", emptyTokenUsage());
+            throw error;
+          }
+          if (Buffer.byteLength(workerResult.text, "utf8") > MAX_AGENT_RESULT_BYTES) {
+            recordAttempt(attemptId, attempt, "failed", tokens);
+            throw new Error(`agent output exceeds ${MAX_AGENT_RESULT_BYTES} bytes`);
+          }
 
           if (!structuredOutput) {
+            recordAttempt(attemptId, attempt, "completed", tokens);
             resultValue = workerResult.text;
             completed = true;
             break;
@@ -1913,51 +2183,85 @@ async function executeWorkflowCore(
           const parsed = parseStructuredOutput(workerResult.text);
           const validationError = parsed.error ?? validateStructuredValue(parsed.value, structuredOutput.schema);
           if (!validationError) {
+            recordAttempt(attemptId, attempt, "completed", tokens);
             resultValue = parsed.value;
             completed = true;
             break;
           }
+          recordAttempt(attemptId, attempt, "invalid", tokens);
           lastStructuredError = validationError;
           if (attempt + 1 < attempts) {
             writeRunEvent(cwd, runId, { type: "retry", index: callIndex, label, phase: assignedPhase, attempt: attempt + 1, error: validationError });
           }
         }
+        throwIfAborted();
         if (!completed) throw new Error(`Structured output validation failed: ${lastStructuredError}`);
 
-        if (worktreePath) {
-          await withWorkspaceMergeLock(cwd, () => withWorkspaceMutationLock(cwd, () => shared.mergeLimiter(async () => {
-            const status = execFileSync("git", ["status", "--porcelain"], { cwd: worktreePath, encoding: "utf-8" }).trim();
-            if (!status) return;
-            execFileSync("git", ["add", "-A"], { cwd: worktreePath, stdio: "ignore" });
-            execFileSync("git", ["commit", "-m", `workflow ${label}`, "--no-verify"], { cwd: worktreePath, stdio: "ignore" });
-            const commitHash = execFileSync("git", ["rev-parse", "HEAD"], { cwd: worktreePath, encoding: "utf-8" }).trim();
-            const mainStatus = execFileSync("git", ["status", "--porcelain=v1", "--untracked-files=all"], { cwd: workspaceKey, encoding: "utf-8" });
-            if (filterWorkflowManagedGitStatus(mainStatus, cwd, workspaceKey)) {
-              preserveWorktree = true;
-              throw new Error("main checkout has uncommitted changes; worktree merge refused");
-            }
-            try {
-              execFileSync("git", ["cherry-pick", commitHash, "--no-edit"], { cwd, stdio: "ignore" });
-            } catch (error) {
-              try { execFileSync("git", ["cherry-pick", "--abort"], { cwd, stdio: "ignore" }); } catch {}
-              preserveWorktree = true;
-              throw new Error(`worktree merge conflict for "${label}"; preserved at ${worktreePath}`);
-            }
-          }), workspaceKey), workspaceKey);
-        }
-
-        writeJournalEntry(cwd, runId, {
+        const journalEntry: JournalEntry = {
           index: callIndex,
           hash: callHash,
           result: resultValue,
           tokens: callUsage,
           durationMs: Date.now() - agentStart,
-        });
-        writeRunEvent(cwd, runId, { type: "completed", index: callIndex, label, phase: assignedPhase, usage: callUsage, durationMs: Date.now() - agentStart });
+        };
+        if (worktreePath) {
+          await withWorkspaceMergeLock(cwd, () => withWorkspaceMutationLock(cwd, () => shared.mergeLimiter(async () => {
+            const status = execFileSync("git", ["status", "--porcelain"], { cwd: worktreePath, encoding: "utf-8" }).trim();
+            if (!status) return;
+            const baseHead = execFileSync("git", ["rev-parse", "HEAD"], { cwd, encoding: "utf-8" }).trim();
+            const mainStatus = execFileSync("git", ["status", "--porcelain=v1", "--untracked-files=all"], { cwd: workspaceKey, encoding: "utf-8" });
+            if (filterWorkflowManagedGitStatus(mainStatus, cwd, workspaceKey)) {
+              preserveWorktree = true;
+              throw new Error("main checkout has uncommitted changes; worktree merge refused");
+            }
+            writeRunJson(cwd, runId, PENDING_MERGE_FILE, {
+              index: callIndex,
+              hash: callHash,
+              label,
+              phase: assignedPhase,
+              baseHead,
+              worktreePath: worktreePath!,
+              commitHash: "",
+              journal: journalEntry,
+            } satisfies PendingMerge);
+            execFileSync("git", ["add", "-A"], { cwd: worktreePath, stdio: "ignore" });
+            execFileSync("git", ["commit", "-m", `workflow ${label}`, "--no-verify"], { cwd: worktreePath, stdio: "ignore" });
+            const commitHash = execFileSync("git", ["rev-parse", "HEAD"], { cwd: worktreePath, encoding: "utf-8" }).trim();
+            options.runtime?.testHooks?.afterWorktreeCommit?.();
+            writeRunJson(cwd, runId, PENDING_MERGE_FILE, {
+              index: callIndex,
+              hash: callHash,
+              label,
+              phase: assignedPhase,
+              baseHead,
+              worktreePath: worktreePath!,
+              commitHash,
+              journal: journalEntry,
+            } satisfies PendingMerge);
+            try {
+              execFileSync("git", ["cherry-pick", commitHash, "--no-edit"], { cwd, stdio: "ignore" });
+              options.runtime?.testHooks?.afterWorktreeCherryPick?.();
+            } catch (error) {
+              try { execFileSync("git", ["cherry-pick", "--abort"], { cwd, stdio: "ignore" }); } catch {}
+              preserveWorktree = true;
+              if (error instanceof Error && error.message === "injected after worktree cherry-pick") throw error;
+              throw new Error(`worktree merge conflict for "${label}"; preserved at ${worktreePath}`);
+            }
+          }), workspaceKey), workspaceKey);
+        }
+
+        writeJournalEntry(cwd, runId, journalEntry);
+        writeRunEvent(cwd, runId, { type: "completed", index: callIndex, label, phase: assignedPhase, usage: callUsage, durationMs: journalEntry.durationMs });
+        if (worktreePath) removeRunMarker(cwd, runId, PENDING_MERGE_FILE);
         update(`workflow ${runId}: completed ${label}`);
         return resultValue;
       } catch (error) {
-        if (worktreePath) preserveWorktree = true;
+        if (worktreePath && !preserveWorktree) {
+          try {
+            const dirty = execFileSync("git", ["status", "--porcelain", "--untracked-files=all"], { cwd: worktreePath, encoding: "utf-8" }).trim();
+            preserveWorktree = dirty.length > 0 || isRegularFile(join(getJournalDir(cwd, runId), PENDING_MERGE_FILE));
+          } catch {}
+        }
         const control = decodeWorkflowControl(error);
         const message = error instanceof Error ? error.message : String(error);
         writeRunEvent(cwd, runId, { type: control ? "cancelled" : "failed", index: callIndex, label, phase: assignedPhase, error: message, usage: callUsage, durationMs: Date.now() - agentStart });
@@ -2183,26 +2487,58 @@ ${JSON.stringify(results).slice(0, 4000)}`, { label: "completeness critic", effe
     if (Buffer.byteLength(encoded, "utf8") > MAX_RESEARCH_REQUEST_BYTES) throw new Error("research request is too large");
     if (shared.researchCount >= MAX_RESEARCH_CALLS) throw new Error(`Research limit exceeded (${MAX_RESEARCH_CALLS})`);
     shared.researchCount++;
-    return shared.researchLimiter(async () => {
-      const controller = new AbortController();
-      const unlink = linkAbortSignal(options.signal, controller);
-      const timeout = setTimeout(() => controller.abort(), MAX_RESEARCH_TIMEOUT_MS);
+    const controller = new AbortController();
+    const unlink = linkAbortSignal(options.signal, controller);
+    let timeout: ReturnType<typeof setTimeout> | undefined;
+    let removeParentAbort: (() => void) | undefined;
+    let operationPromise: Promise<unknown> | undefined;
+    const startedAt = Date.now();
+    const timeoutPromise = new Promise<never>((_, reject) => {
+      timeout = setTimeout(() => {
+        controller.abort();
+        reject(new ResearchTimeoutError());
+      }, researchTimeoutMs);
+    });
+    const abortPromise = new Promise<never>((_, reject) => {
+      if (!options.signal) return;
+      const onAbort = () => reject(new WorkflowControlError("aborted", "Workflow aborted"));
+      if (options.signal.aborted) onAbort();
+      else {
+        options.signal.addEventListener("abort", onAbort, { once: true });
+        removeParentAbort = () => options.signal?.removeEventListener("abort", onAbort);
+      }
+    });
+    operationPromise = shared.researchLimiter(async () => {
       try {
         if (options.signal?.aborted) throw new WorkflowControlError("aborted", "Workflow aborted");
-        const value = await researchBackend.run(normalized, controller.signal);
+        if (controller.signal.aborted || Date.now() - startedAt >= researchTimeoutMs) throw new ResearchTimeoutError();
+        const remainingMs = Math.max(1, researchTimeoutMs - (Date.now() - startedAt));
+        const backendPromise = Promise.resolve().then(() => researchBackend.run(normalized, controller.signal));
+        const backendTimeout = new Promise<never>((_, reject) => {
+          setTimeout(() => reject(new ResearchTimeoutError()), remainingMs);
+        });
+        const value = await Promise.race([backendPromise, backendTimeout]);
+        if (controller.signal.aborted || Date.now() - startedAt >= researchTimeoutMs) throw new ResearchTimeoutError();
         const resultJson = JSON.stringify(value);
         if (resultJson === undefined || Buffer.byteLength(resultJson, "utf8") > MAX_RESEARCH_RESULT_BYTES) throw new Error(`research result exceeds ${MAX_RESEARCH_RESULT_BYTES} bytes`);
         writeRunEvent(cwd, runId, { type: "research", source, operation, bytes: Buffer.byteLength(resultJson, "utf8") });
         return value;
-      } catch (error) {
-        if (options.signal?.aborted) throw new WorkflowControlError("aborted", "Workflow aborted");
-        if (controller.signal.aborted) throw new Error("Research request timed out");
-        throw error;
       } finally {
-        clearTimeout(timeout);
-        unlink();
+        // The outer race observes late backend failures after a timeout.
       }
     });
+    try {
+      return await Promise.race([operationPromise, timeoutPromise, abortPromise]);
+    } catch (error) {
+      if (options.signal?.aborted) throw new WorkflowControlError("aborted", "Workflow aborted");
+      if (error instanceof ResearchTimeoutError || controller.signal.aborted) throw new ResearchTimeoutError();
+      throw error;
+    } finally {
+      if (timeout) clearTimeout(timeout);
+      removeParentAbort?.();
+      operationPromise?.catch(() => {});
+      unlink();
+    }
   };
 
   // ── Execute in VM ──────────────────────────────────────────────────
@@ -2400,7 +2736,11 @@ async function executeWorkflow(script: string, options: ExecuteWorkflowOptions =
         createdAt: priorMeta?.createdAt ?? Date.now(),
       });
     }
-    const result = await executeWorkflowCore(script, { ...options, cwd, runId, lock: false });
+    const reconciledPendingMerge = await reconcilePendingMerge(cwd, runId);
+    const coreOptions = reconciledPendingMerge
+      ? { ...options, resumeJournal: readJournal(cwd, runId) }
+      : options;
+    const result = await executeWorkflowCore(script, { ...coreOptions, cwd, runId, lock: false });
     if (ownsLock) {
       markRunComplete(cwd, runId, result);
       notifyExecutionState(options.runtime, runId, "completed");
@@ -2834,12 +3174,19 @@ function getRunStatus(cwd: string, runId: string): Record<string, unknown> | nul
   let executionPolicy: Record<string, unknown> | undefined;
   let createdAt: number | undefined;
   let agentCount = 0;
-  let tokenUsage = { input: 0, output: 0, total: 0, cost: 0 };
+  let tokenUsage: TokenUsage = emptyTokenUsage();
   let error: string | undefined;
   let result: unknown;
   const progress = { running: 0, completed: 0, failed: 0, cached: 0 };
   let latestTask: Record<string, unknown> | undefined;
   const journalIndices = new Set<number>();
+  let attemptCallIndices = new Set<number>();
+
+  try {
+    const ledger = readAttemptLedger(cwd, runId);
+    tokenUsage = ledger.usage;
+    attemptCallIndices = ledger.callIndices;
+  } catch {}
 
   try {
     if (isRegularFile(metaPath)) {
@@ -2859,7 +3206,7 @@ function getRunStatus(cwd: string, runId: string): Record<string, unknown> | nul
         try {
           const entry = JSON.parse(line);
           if (Number.isInteger(entry.index)) journalIndices.add(entry.index);
-          if (entry.tokens) {
+          if (entry.tokens && Number.isInteger(entry.index) && !attemptCallIndices.has(entry.index)) {
             tokenUsage.input += Number.isFinite(entry.tokens.input) && entry.tokens.input >= 0 ? entry.tokens.input : 0;
             tokenUsage.output += Number.isFinite(entry.tokens.output) && entry.tokens.output >= 0 ? entry.tokens.output : 0;
             tokenUsage.total += Number.isFinite(entry.tokens.total) && entry.tokens.total >= 0 ? entry.tokens.total : 0;
@@ -2890,7 +3237,7 @@ function getRunStatus(cwd: string, runId: string): Record<string, unknown> | nul
             else if (event.type === "cancelled") taskStates.set(event.index, "cancelled");
             else if (event.type === "cached") taskStates.set(event.index, "cached");
           }
-          if ((event.type === "failed" || event.type === "cancelled") && event.usage && !journalIndices.has(event.index)) {
+          if ((event.type === "failed" || event.type === "cancelled") && event.usage && !journalIndices.has(event.index) && !attemptCallIndices.has(event.index)) {
             tokenUsage.input += Number.isFinite(event.usage.input) && event.usage.input >= 0 ? event.usage.input : 0;
             tokenUsage.output += Number.isFinite(event.usage.output) && event.usage.output >= 0 ? event.usage.output : 0;
             tokenUsage.total += Number.isFinite(event.usage.total) && event.usage.total >= 0 ? event.usage.total : 0;
@@ -3059,6 +3406,16 @@ function listSavedCommands(cwd: string): Array<{ name: string; path: string }> {
   }
   
   return commands;
+}
+
+function listWorkflowWorktrees(cwd: string, runId: string): string[] {
+  try {
+    const root = resolve(cwd, ".pi/worktrees");
+    const output = execFileSync("git", ["worktree", "list", "--porcelain"], { cwd, encoding: "utf8" });
+    return output.split("\n").filter(line => line.startsWith("worktree ")).map(line => resolve(line.slice("worktree ".length).trim())).filter(path => path.startsWith(`${root}${sep}${runId}-`));
+  } catch {
+    return [];
+  }
 }
 
 function listWorkflowRuns(cwd: string): WorkflowRunRecord[] {
@@ -3242,18 +3599,43 @@ export default function registerExtension(pi: ExtensionAPI) {
         let cleaned = 0;
         for (const r of runs) {
           if (r.status === "running" || r.status === "paused" || r.status === "orphaned") continue; // preserve active and resumable runs
+          let releaseCleanup: (() => void) | undefined;
+          let quarantinePath: string | undefined;
           try {
+            // Claim the run immediately before inspecting it. A live resumer
+            // owns this lock and therefore wins the race with cleanup.
+            claimRun(cwd, r.runId);
+            releaseCleanup = () => releaseRun(cwd, r.runId);
+            const fresh = getRunStatus(cwd, r.runId);
+            if (!fresh || !["completed", "error", "cancelled"].includes(fresh.status as string)) continue;
             const dir = join(cwd, WORKFLOW_DIR, r.runId);
             assertNoSymlinkPath(dir, cwd);
             const metaPath = join(dir, "meta.json");
             if (isRegularFile(metaPath)) {
               const stat = statSync(metaPath);
               if (stat.mtimeMs < cutoff) {
-                rmSync(dir, { recursive: true, force: true });
+                if (isRegularFile(join(dir, PENDING_MERGE_FILE))) continue;
+                const worktrees = listWorkflowWorktrees(cwd, r.runId);
+                await withWorkspaceMutationLock(cwd, async () => {
+                  for (const worktree of worktrees) {
+                    const status = execFileSync("git", ["status", "--porcelain", "--untracked-files=all"], { cwd: worktree, encoding: "utf8" }).trim();
+                    if (status) throw new Error(`preserving changed workflow worktree ${worktree}`);
+                    execFileSync("git", ["worktree", "remove", worktree, "--force"], { cwd, stdio: "ignore" });
+                  }
+                });
+                const parent = dirname(dir);
+                quarantinePath = join(parent, `.cleaning-${r.runId}-${randomUUID()}`);
+                renameSync(dir, quarantinePath);
                 cleaned++;
               }
             }
           } catch {}
+          finally {
+            releaseCleanup?.();
+          }
+          if (quarantinePath) {
+            try { rmSync(quarantinePath, { recursive: true, force: true }); } catch {}
+          }
         }
         ctx.ui.notify(`Cleaned ${cleaned} run(s) older than ${maxAgeDays} day(s).`, "info");
         return;

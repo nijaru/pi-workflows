@@ -2,10 +2,10 @@ import { describe, test, expect } from "bun:test";
 import { fauxAssistantMessage, fauxProvider } from "@earendil-works/pi-ai/providers/faux";
 import { AuthStorage, ModelRegistry } from "@earendil-works/pi-coding-agent";
 import { execFileSync } from "node:child_process";
-import { mkdtempSync, mkdirSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { mkdtempSync, mkdirSync, readFileSync, rmSync, utimesSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { executeWorkflow, getRunStatus, parseScript, enrichSyntaxError, suggestSyntaxFix, validateSyntax, workspaceIdentity } from "./index";
+import registerExtension, { executeWorkflow, getRunStatus, parseScript, enrichSyntaxError, suggestSyntaxFix, validateSyntax, workspaceIdentity } from "./index";
 
 describe("pi-workflows", () => {
   describe("parseScript", () => {
@@ -149,6 +149,64 @@ const value = 1 / Date.now();
       }
     });
 
+    test("carries failed attempt usage into a forced resume without double counting", async () => {
+      const cwd = mkdtempSync(join(tmpdir(), "pi-workflows-test-"));
+      let calls = 0;
+      const runtime = {
+        workerBackend: {
+          id: "resume-usage-worker",
+          toolIdentity: "read",
+          contextIdentity: "test-context",
+          run: async () => {
+            calls++;
+            return { text: calls === 1 ? "not-json" : '{"ok":true}', tokens: { input: 2000, output: 2000, total: 4000, cost: 0.25 } };
+          },
+        },
+      } as any;
+      const script = `export const meta = { name: "resume-usage", description: "test" };\nreturn await agent("inspect", { effect: "read", output: { schema: { type: "object", required: ["ok"], properties: { ok: { type: "boolean" } } }, maxRetries: 0 } });`;
+      try {
+        await expect(executeWorkflow(script, { cwd, runId: "run-resume-usage", runtime, tokenBudget: 10000 })).rejects.toThrow("Structured output validation failed");
+        expect(getRunStatus(cwd, "run-resume-usage")).toMatchObject({ tokenUsage: { total: 4000, cost: 0.25 } });
+        const result = await executeWorkflow(script, { cwd, runId: "run-resume-usage", runtime, tokenBudget: 10000 });
+        expect(result.result).toEqual({ ok: true });
+        expect(result.tokenUsage).toMatchObject({ input: 4000, output: 4000, total: 8000, cost: 0.5 });
+        expect(getRunStatus(cwd, "run-resume-usage")).toMatchObject({ status: "completed", tokenUsage: { total: 8000, cost: 0.5 } });
+        expect(calls).toBe(2);
+      } finally {
+        rmSync(cwd, { recursive: true, force: true });
+      }
+    });
+
+    test("records token usage for a cancelled worker attempt", async () => {
+      const cwd = mkdtempSync(join(tmpdir(), "pi-workflows-test-"));
+      const controller = new AbortController();
+      let markStarted!: () => void;
+      const started = new Promise<void>(resolve => { markStarted = resolve; });
+      const runtime = {
+        workerBackend: {
+          id: "cancel-usage-worker",
+          toolIdentity: "read",
+          contextIdentity: "test-context",
+          run: async (request: { signal?: AbortSignal }) => {
+            markStarted();
+            await new Promise<void>(resolve => request.signal?.addEventListener("abort", () => resolve(), { once: true }));
+            return { text: "late result", tokens: { input: 5, output: 7, total: 12, cost: 0.125 } };
+          },
+        },
+      } as any;
+      const script = `export const meta = { name: "cancel-usage", description: "test" };\nreturn await agent("wait", { effect: "read" });`;
+      try {
+        const run = executeWorkflow(script, { cwd, runId: "run-cancel-usage", runtime, signal: controller.signal });
+        await started;
+        controller.abort();
+        await expect(run).rejects.toThrow("Workflow aborted");
+        expect(getRunStatus(cwd, "run-cancel-usage")).toMatchObject({ status: "cancelled", tokenUsage: { input: 5, output: 7, total: 12, cost: 0.125 } });
+      } finally {
+        controller.abort();
+        rmSync(cwd, { recursive: true, force: true });
+      }
+    });
+
     test("uses the internal worker backend and fingerprints its identity", async () => {
       const cwd = mkdtempSync(join(tmpdir(), "pi-workflows-test-"));
       const calls: Array<{ label: string; maxOutputTokens?: number; tools?: string[] }> = [];
@@ -206,6 +264,30 @@ const value = 1 / Date.now();
         expect(events).toContain('"type":"research"');
         const meta = JSON.parse(readFileSync(join(runDir, "meta.json"), "utf8"));
         expect(meta.executionPolicy.researchBackend).toBe("test-research");
+      } finally {
+        rmSync(cwd, { recursive: true, force: true });
+      }
+    });
+
+    test("enforces research timeout when the backend ignores abort", async () => {
+      const cwd = mkdtempSync(join(tmpdir(), "pi-workflows-test-"));
+      let settled = false;
+      try {
+        const researchBackend = {
+          id: "slow-research",
+          sources: ["web_search"] as const,
+          run: async () => {
+            await new Promise(resolve => setTimeout(resolve, 40));
+            settled = true;
+            return { late: true };
+          },
+        };
+        const script = `export const meta = { name: "research-timeout", description: "test" };\nreturn await research({ source: "web_search", query: "slow" });`;
+        await expect(executeWorkflow(script, { cwd, runId: "run-research-timeout", researchBackend, researchTimeoutMs: 5 })).rejects.toThrow("Research request timed out");
+        await new Promise(resolve => setTimeout(resolve, 50));
+        expect(settled).toBe(true);
+        const eventsPath = join(cwd, ".pi", "workflows", "run-research-timeout", "events.jsonl");
+        expect(() => readFileSync(eventsPath, "utf8")).toThrow();
       } finally {
         rmSync(cwd, { recursive: true, force: true });
       }
@@ -356,11 +438,46 @@ const value = 1 / Date.now();
         const script = `export const meta = { name: "structured", description: "test" };\nreturn await agent("inspect", { label: "structured", effect: "read", output: { schema: { type: "object", required: ["ok"], properties: { ok: { type: "boolean" } } } } });`;
         const result = await executeWorkflow(script, { cwd, runId: "run-structured", runtime, tokenBudget: 20000 });
         expect(result.result).toEqual({ ok: true });
+        expect(result.tokenUsage.total).toBe(4);
+        expect(getRunStatus(cwd, "run-structured")).toMatchObject({ tokenUsage: { total: 4 } });
         expect(prompts).toHaveLength(2);
         expect(prompts[1]).toContain("Previous response failed validation");
       } finally {
         rmSync(cwd, { recursive: true, force: true });
       }
+    });
+
+    test("removes a clean failed worktree but preserves changed failure state", async () => {
+      const runCase = async (changed: boolean) => {
+        const cwd = mkdtempSync(join(tmpdir(), "pi-workflows-test-"));
+        try {
+          execFileSync("git", ["init", "-q"], { cwd });
+          execFileSync("git", ["config", "user.email", "test@example.com"], { cwd });
+          execFileSync("git", ["config", "user.name", "pi-workflows-test"], { cwd });
+          writeFileSync(join(cwd, "base.txt"), "base\n");
+          execFileSync("git", ["add", "base.txt"], { cwd });
+          execFileSync("git", ["commit", "-qm", "init"], { cwd });
+          const runtime = {
+            workerBackend: {
+              id: changed ? "changed-failure" : "clean-failure",
+              toolIdentity: "write",
+              contextIdentity: "test-context",
+              run: async (request: { cwd: string }) => {
+                if (changed) writeFileSync(join(request.cwd, "failed.txt"), "changed\n");
+                throw new Error("worker failed");
+              },
+            },
+          } as any;
+          const script = `export const meta = { name: "failed-worktree", description: "test" };\nreturn await agent("write", { isolation: "worktree" });`;
+          await expect(executeWorkflow(script, { cwd, runId: changed ? "run-changed-failure" : "run-clean-failure", runtime })).rejects.toThrow("worker failed");
+          const worktreeEntries = execFileSync("git", ["worktree", "list", "--porcelain"], { cwd, encoding: "utf8" }).split("\n\n").filter(Boolean);
+          expect(worktreeEntries.some(entry => entry.includes(".pi/worktrees/"))).toBe(changed);
+        } finally {
+          rmSync(cwd, { recursive: true, force: true });
+        }
+      };
+      await runCase(false);
+      await runCase(true);
     });
 
     test("does not retry invalid structured output for write effects", async () => {
@@ -492,6 +609,54 @@ const value = 1 / Date.now();
       }
     });
 
+    test("reconciles a worktree merge after a crash between cherry-pick and journaling", async () => {
+      const cwd = mkdtempSync(join(tmpdir(), "pi-workflows-test-"));
+      let calls = 0;
+      let injectCrash = true;
+      try {
+        execFileSync("git", ["init", "-q"], { cwd });
+        execFileSync("git", ["config", "user.email", "test@example.com"], { cwd });
+        execFileSync("git", ["config", "user.name", "pi-workflows-test"], { cwd });
+        writeFileSync(join(cwd, "base.txt"), "base\n");
+        execFileSync("git", ["add", "base.txt"], { cwd });
+        execFileSync("git", ["commit", "-qm", "init"], { cwd });
+        const runtime = {
+          workerBackend: {
+            id: "crash-merge-worker",
+            toolIdentity: "write",
+            contextIdentity: "test-context",
+            run: async (request: { cwd: string }) => {
+              calls++;
+              writeFileSync(join(request.cwd, "created.txt"), "created\n");
+              return { text: "done", tokens: { input: 1, output: 1, total: 2, cost: 0 } };
+            },
+          },
+          testHooks: {
+            afterWorktreeCommit: () => {
+              if (injectCrash) {
+                injectCrash = false;
+                throw new Error("injected after worktree commit");
+              }
+            },
+          },
+        } as any;
+        const script = `export const meta = { name: "crash-merge", description: "test" };\nreturn await agent("write", { isolation: "worktree" });`;
+        await expect(executeWorkflow(script, { cwd, runId: "run-crash-merge", runtime })).rejects.toThrow("injected after worktree commit");
+        const pending = join(cwd, ".pi", "workflows", "run-crash-merge", "pending-merge.json");
+        expect(readFileSync(pending, "utf8")).toContain("commitHash");
+        const result = await executeWorkflow(script, { cwd, runId: "run-crash-merge", runtime, resumeJournal: new Map() });
+        expect(result.result).toBe("done");
+        expect(readFileSync(join(cwd, "created.txt"), "utf8")).toBe("created\n");
+        expect(calls).toBe(1);
+        expect(() => readFileSync(pending, "utf8")).toThrow();
+        expect(getRunStatus(cwd, "run-crash-merge")).toMatchObject({ status: "completed", tokenUsage: { total: 2 } });
+        const worktreeEntries = execFileSync("git", ["worktree", "list", "--porcelain"], { cwd, encoding: "utf8" }).split("\n\n").filter(Boolean);
+        expect(worktreeEntries.some(entry => entry.includes(".pi/worktrees/"))).toBe(false);
+      } finally {
+        rmSync(cwd, { recursive: true, force: true });
+      }
+    });
+
     test("direct execution records completion and hides host globals", async () => {
       const cwd = mkdtempSync(join(tmpdir(), "pi-workflows-test-"));
       try {
@@ -515,6 +680,32 @@ const value = 1 / Date.now();
       expect(mod.createWorkflowStatusTool).toBeTypeOf("function");
       expect(mod.getRunStatus).toBeTypeOf("function");
       expect(mod.enrichSyntaxError).toBeTypeOf("function");
+    });
+
+    test("clean does not remove a run locked by a live coordinator", async () => {
+      const cwd = mkdtempSync(join(tmpdir(), "pi-workflows-test-"));
+      const commands = new Map<string, any>();
+      try {
+        const runDir = join(cwd, ".pi", "workflows", "run-live-clean");
+        mkdirSync(runDir, { recursive: true });
+        writeFileSync(join(runDir, "meta.json"), JSON.stringify({ name: "live", description: "test", createdAt: 1 }));
+        writeFileSync(join(runDir, "complete.log"), "done\n");
+        writeFileSync(join(runDir, "run.lock"), JSON.stringify({ pid: process.pid, token: "live" }));
+        utimesSync(runDir, new Date(1), new Date(1));
+        const mod = await import("./index");
+        const fakePi = {
+          on: () => {},
+          registerTool: () => {},
+          registerCommand: (name: string, command: any) => commands.set(name, command),
+          getActiveTools: () => [],
+          setActiveTools: () => {},
+        };
+        mod.default(fakePi as any);
+        await commands.get("workflows").handler("clean 0", { cwd, ui: { notify: () => {} } });
+        expect(readFileSync(join(runDir, "meta.json"), "utf8")).toContain('"live"');
+      } finally {
+        rmSync(cwd, { recursive: true, force: true });
+      }
     });
 
     test("coordinates host mutations with workflow canonical writes", async () => {
