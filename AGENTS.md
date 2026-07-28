@@ -4,7 +4,7 @@ Script-as-plan orchestration for pi. Model writes JS, runtime executes in a sand
 
 ## Architecture
 
-- Single extension: `index.ts` (~1330 lines)
+- Single extension: `index.ts` (runtime, persistence, worker, and bounded capability boundaries)
 - Journal: `.pi/workflows/<run-id>/journal.jsonl`
 - Three core functions: agent(), parallel(), pipeline()
 - Quality helpers: verify(), judgePanel(), loopUntilDry(), completenessCheck()
@@ -38,15 +38,20 @@ Agent execution uses pi's core SDK directly:
 
 ```typescript
 const sdk = await import("@earendil-works/pi-coding-agent");
-const auth = sdk.AuthStorage.create(join(agentDir, "auth.json"));
-const registry = sdk.ModelRegistry.create(auth, join(agentDir, "models.json"));
+const runtime = await sdk.ModelRuntime.create({
+  authPath: join(agentDir, "auth.json"),
+  modelsPath: join(agentDir, "models.json"),
+});
+const thinkingLevel = "medium";
 
 const { session } = await sdk.createAgentSession({
   cwd, agentDir,
+  modelRuntime: runtime, // Pi 0.82+ canonical auth/model runtime
+  thinkingLevel, // inherit the parent session's current level
   sessionManager: sdk.SessionManager.inMemory(),
   settingsManager: sdk.SettingsManager.create(cwd, agentDir),
   customTools: sdk.createCodingTools(cwd),
-  model, // resolved via ModelRegistry
+  model, // resolved via ModelRuntime
 });
 
 await session.prompt(text);
@@ -55,13 +60,14 @@ const stats = session.getSessionStats(); // { tokens: { input, output, total }, 
 session.dispose();
 ```
 
-- Auth + registry are singletons (created once per process via `loadSdk()` / `getAuthAndRegistry()`)
+- The built-in worker reuses the parent Pi 0.82+ `ModelRuntime` and current thinking level. Legacy `authStorage`/`modelRegistry` options are used only on pre-0.82 hosts and test fakes.
+- Modern direct callers get a cached `ModelRuntime`; legacy auth/registry fallback objects are cached once per process for old hosts.
 - `session.prompt()` returns void — extract response from `session.messages`
 - `session.getSessionStats().cost` can be `undefined`/`NaN` for free models — default to `0`
 
 ## Sandbox Rules
 
-The VM sandbox exposes only: `agent`, `parallel`, `pipeline`, `log`, `phase`, `verify`, `judgePanel`, `loopUntilDry`, `completenessCheck`, `args`, `cwd`, `budget`.
+The VM sandbox exposes only: `agent`, `parallel`, `pipeline`, `research`, `log`, `phase`, `verify`, `judgePanel`, `loopUntilDry`, `completenessCheck`, `args`, `cwd`, `budget`.
 
 **Blocked:**
 - `process` (except via host `process.cwd()`/`process.env`)
@@ -79,8 +85,8 @@ The VM sandbox exposes only: `agent`, `parallel`, `pipeline`, `log`, `phase`, `v
 
 - **Abort handling:** Background catch checks `signal?.aborted || error === "Workflow aborted"` — abort is deliberate cancellation, not failure. No `error.log` written, notifies as info.
 - **Cost reporting:** Default `stats.cost` to `0` for free models. Budget is token-based (unaffected).
-- **Resume scanning:** `listWorkflowRuns()` scans by workflow name. Multiple incomplete runs for the same name is unlikely but possible — picks first match.
-- **Worktree merge:** Cherry-pick with `-X theirs` fallback, then `git merge` fallback. Conflicts are logged, not fatal.
+- **Resume scanning:** `listWorkflowRuns()` scans by workflow name. Multiple incomplete runs for the same name is unlikely but possible — picks first match. Fingerprints include dirty-file contents, not only Git status text.
+- **Canonical mutation coordination:** workflow locks and host `tool_call` guards prevent Pi edit/write races; worktree merges remain serialized and fail closed on dirty/conflicting main checkouts.
 - **Determinism prelude:** `Date` constructor wrapper uses `new _D(...a)`, not `Reflect.construct`.
 - **Synchronous syntax validation:** `execute()` eagerly validates via `validateSyntax()` (uses `new Function()`) before any execution path. Syntax errors throw immediately as the tool result with line context + heuristic suggestions. **Do NOT use `new vm.Script()` for validation** — Bun defers parsing, so it silently accepts broken code; the error surfaces at `runInContext()` time instead.
 - **Bun vm.Script deferred parsing:** `new vm.Script(code)` does NOT parse on Bun (JavaScriptCore). Parsing happens lazily at `runInContext()`. `runInContext` is wrapped in try/catch that enriches deferred parse errors as a fallback.

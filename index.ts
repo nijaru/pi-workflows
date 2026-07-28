@@ -28,6 +28,8 @@ import {
   fstatSync,
   futimesSync,
   readFileSync,
+  readlinkSync,
+  readSync,
   readdirSync,
   realpathSync,
   renameSync,
@@ -82,10 +84,32 @@ interface ExecutionEnvelope {
   onState?: (state: { runId: string; status: "completed" | "error" | "paused" | "cancelled" }) => void;
 }
 
+export interface ResearchRequest {
+  source: "web_search" | "exa" | "context7" | "mcp";
+  query?: string;
+  url?: string;
+  libraryId?: string;
+  operation?: "resolve" | "query";
+  tool?: string;
+  args?: unknown;
+  limit?: number;
+}
+
+export interface ResearchBackend {
+  readonly id: string;
+  readonly sources: readonly ResearchRequest["source"][];
+  run(request: ResearchRequest, signal: AbortSignal): Promise<unknown>;
+}
+
 interface WorkflowRuntime {
+  /** Pi 0.82+ canonical runtime. */
+  modelRuntime?: any;
+  /** Compatibility inputs for pre-0.82 Pi hosts and tests. */
   modelRegistry?: any;
   authStorage?: any;
   defaultModel?: any;
+  thinkingLevel?: string;
+  researchBackend?: ResearchBackend;
   agentDir?: string;
   onUpdate?: (update: AgentToolResult<unknown>) => void;
   executionEnvelope?: ExecutionEnvelope;
@@ -143,6 +167,8 @@ interface ExecuteWorkflowOptions {
   signal?: AbortSignal;
   resumeJournal?: Map<number, JournalEntry>;
   runtime?: WorkflowRuntime;
+  /** Explicit bounded host research capability for direct SDK callers. */
+  researchBackend?: ResearchBackend;
   timeoutMs?: number;
   lock?: boolean;
 }
@@ -229,6 +255,11 @@ const MAX_LOG_BYTES = 2 * 1024 * 1024;
 const MAX_WORKFLOW_TIMEOUT_MS = 30 * 60 * 1000;
 const MAX_REVIEWERS = 16;
 const MAX_ROUNDS = 100;
+const MAX_RESEARCH_CALLS = 32;
+const MAX_RESEARCH_CONCURRENCY = 4;
+const MAX_RESEARCH_REQUEST_BYTES = 32 * 1024;
+const MAX_RESEARCH_RESULT_BYTES = 1024 * 1024;
+const MAX_RESEARCH_TIMEOUT_MS = 60 * 1000;
 const ESTIMATED_SYSTEM_TOKENS = 2048;
 const SDK_WORKER_TOOLS = ["read", "bash", "edit", "write"] as const;
 const SDK_READ_ONLY_WORKER_TOOLS = ["read", "grep", "find", "ls"] as const;
@@ -242,6 +273,7 @@ const RUN_LOCK_TOKENS = new Map<string, string>();
 const ACTIVE_RUN_CONTROLLERS = new Map<string, AbortController>();
 const ACTIVE_RUN_DRAINS = new Map<string, Promise<unknown>>();
 const ACTIVE_CANONICAL_WRITES = new Set<string>();
+const ACTIVE_HOST_MUTATIONS = new Map<string, Set<string>>();
 const WORKSPACE_MERGE_QUEUES = new Map<string, Promise<void>>();
 const LOCK_STALE_MS = 24 * 60 * 60 * 1000;
 const LOCK_HEARTBEAT_MS = 30 * 1000;
@@ -294,22 +326,64 @@ function filterWorkflowManagedGitStatus(status: string, workflowCwd: string, rep
   }).join("\n");
 }
 
+function hashWorkspacePath(path: string): string {
+  try {
+    const stat = lstatSync(path);
+    if (stat.isSymbolicLink()) return `symlink:${readlinkSync(path)}`;
+    if (!stat.isFile()) return `type:${stat.mode.toString(8)}:${stat.size}`;
+    const fd = openSync(path, fsConstants.O_RDONLY | (fsConstants.O_NOFOLLOW ?? 0));
+    const digest = createHash("sha256");
+    const buffer = Buffer.allocUnsafe(64 * 1024);
+    try {
+      let bytes = 0;
+      while ((bytes = readSync(fd, buffer, 0, buffer.length, null)) > 0) digest.update(buffer.subarray(0, bytes));
+    } finally {
+      closeSync(fd);
+    }
+    return `file:${stat.mode.toString(8)}:${digest.digest("hex")}`;
+  } catch (error) {
+    const code = (error as NodeJS.ErrnoException).code;
+    return code === "ENOENT" || code === "ENOTDIR" ? "missing" : `unreadable:${code ?? "error"}`;
+  }
+}
+
+function dirtyWorkspaceFingerprint(status: string, workflowCwd: string, repoRoot: string): string {
+  const records = status.split("\0");
+  const fingerprints: string[] = [];
+  for (let index = 0; index < records.length; index++) {
+    const record = records[index];
+    if (!record) continue;
+    const state = record.slice(0, 2);
+    const paths = [record.slice(3)];
+    if (state.startsWith("R") || state.startsWith("C")) {
+      const renamed = records[++index];
+      if (renamed) paths.push(renamed);
+    }
+    for (const path of paths) {
+      if (!path || workflowManagedGitPath(path, workflowCwd, repoRoot)) continue;
+      const absolute = resolve(repoRoot, path);
+      fingerprints.push(`${state}:${path}:${hashWorkspacePath(absolute)}`);
+    }
+  }
+  return fingerprints.sort().join("\n");
+}
+
 function workspaceIdentity(cwd: string): string {
   const canonical = canonicalCwd(cwd);
   try {
-    const git = (args: string[]) => execFileSync("git", args, { cwd: canonical, encoding: "utf8", stdio: ["ignore", "pipe", "ignore"], maxBuffer: 1024 * 1024 });
+    const git = (args: string[]) => execFileSync("git", args, { cwd: canonical, encoding: "utf8", stdio: ["ignore", "pipe", "ignore"], maxBuffer: MAX_STATE_FILE_BYTES });
     const root = git(["rev-parse", "--show-toplevel"]).trim();
     let branch = "detached";
     try { branch = git(["symbolic-ref", "--quiet", "--short", "HEAD"]).trim() || branch; } catch {}
     const head = git(["rev-parse", "HEAD"]).trim();
     const workspaceRoot = canonicalCwd(root);
-    const status = execFileSync("git", ["status", "--porcelain=v1", "--untracked-files=all"], {
+    const status = execFileSync("git", ["status", "--porcelain=v1", "--untracked-files=all", "-z"], {
       cwd: workspaceRoot,
       encoding: "utf8",
       stdio: ["ignore", "pipe", "ignore"],
       maxBuffer: MAX_STATE_FILE_BYTES,
     });
-    const dirty = createHash("sha256").update(filterWorkflowManagedGitStatus(status, canonical, workspaceRoot)).digest("hex");
+    const dirty = createHash("sha256").update(dirtyWorkspaceFingerprint(status, canonical, workspaceRoot)).digest("hex");
     return `git:${workspaceRoot}|${branch}|${head}|${dirty}`;
   } catch {
     return `path:${canonical}`;
@@ -330,6 +404,56 @@ function isProcessAlive(pid: unknown): boolean {
   catch (error) { return (error as NodeJS.ErrnoException).code === "EPERM"; }
 }
 
+/** Return a PID incarnation marker so a reused PID cannot keep an old lock alive. */
+function processStartIdentity(pid: number): string | undefined {
+  try {
+    if (process.platform === "linux") {
+      const stat = readFileSync(`/proc/${pid}/stat`, "utf8");
+      const end = stat.lastIndexOf(")");
+      const fields = end >= 0 ? stat.slice(end + 1).trim().split(/\s+/) : [];
+      return fields[19];
+    }
+    const started = execFileSync("ps", ["-p", String(pid), "-o", "lstart="], {
+      encoding: "utf8",
+      stdio: ["ignore", "pipe", "ignore"],
+      maxBuffer: 1024,
+    }).trim();
+    return started || undefined;
+  } catch {
+    return undefined;
+  }
+}
+
+function isLockStale(lockPath: string, lock: Record<string, unknown>): boolean {
+  let age = Number.POSITIVE_INFINITY;
+  try { age = Math.max(0, Date.now() - statSync(lockPath).mtimeMs); } catch {}
+  if (age > LOCK_STALE_MS) return true;
+  const pid = lock.pid;
+  if (!isProcessAlive(pid)) return true;
+  if (typeof lock.processStart === "string") {
+    const actual = processStartIdentity(pid as number);
+    if (actual && actual !== lock.processStart) return true;
+  }
+  return false;
+}
+
+function activeHostMutation(cwd: string): boolean {
+  const key = workspaceLockKey(cwd);
+  return (ACTIVE_HOST_MUTATIONS.get(key)?.size ?? 0) > 0;
+}
+
+function workspaceLockIsActive(cwd: string): boolean {
+  const root = workspaceLockKey(cwd);
+  const lockPath = join(root, WORKFLOW_DIR, "workspace.lock");
+  try {
+    if (!isRegularFile(lockPath)) return false;
+    const lock = JSON.parse(readRegularFile(lockPath)) as Record<string, unknown>;
+    return !isLockStale(lockPath, lock);
+  } catch {
+    try { return Date.now() - statSync(lockPath).mtimeMs <= LOCK_STALE_MS; } catch { return false; }
+  }
+}
+
 function claimRun(cwd: string, runId: string): void {
   const key = runKey(cwd, runId);
   if (ACTIVE_RUNS.has(key)) throw new Error(`Workflow run ${runId} is already active.`);
@@ -342,7 +466,7 @@ function claimRun(cwd: string, runId: string): void {
       const token = randomUUID();
       const fd = openSync(lockPath, "wx", 0o600);
       try {
-        writeAll(fd, JSON.stringify({ pid: process.pid, token, startedAt: Date.now() }));
+        writeAll(fd, JSON.stringify({ pid: process.pid, processStart: processStartIdentity(process.pid), token, startedAt: Date.now() }));
       } finally {
         closeSync(fd);
       }
@@ -352,9 +476,8 @@ function claimRun(cwd: string, runId: string): void {
     } catch (error) {
       if ((error as NodeJS.ErrnoException).code !== "EEXIST") throw error;
       try {
-        const lock = JSON.parse(readRegularFile(lockPath));
-        const alive = isProcessAlive(lock.pid);
-        if (!alive || (lock.pid == null && Date.now() - statSync(lockPath).mtimeMs > LOCK_STALE_MS)) {
+        const lock = JSON.parse(readRegularFile(lockPath)) as Record<string, unknown>;
+        if (isLockStale(lockPath, lock)) {
           if (takeOverStaleLock(lockPath, typeof lock.token === "string" ? lock.token : undefined)) continue;
         }
       } catch {
@@ -429,6 +552,7 @@ function takeOverStaleLock(lockPath: string, expectedToken?: string): boolean {
 }
 
 function claimWorkspaceMutation(cwd: string, root = workspaceLockKey(cwd)): () => void {
+  if (activeHostMutation(cwd)) throw new Error("Pi edit/write is active; retry the workflow after it finishes");
   const dir = join(root, WORKFLOW_DIR);
   ensurePrivateDir(dir, root);
   const lockPath = join(dir, "workspace.lock");
@@ -439,7 +563,7 @@ function claimWorkspaceMutation(cwd: string, root = workspaceLockKey(cwd)): () =
       token = randomUUID();
       const fd = openSync(lockPath, "wx", 0o600);
       try {
-        writeAll(fd, JSON.stringify({ pid: process.pid, token, startedAt: Date.now() }));
+        writeAll(fd, JSON.stringify({ pid: process.pid, processStart: processStartIdentity(process.pid), token, startedAt: Date.now() }));
       } finally {
         closeSync(fd);
       }
@@ -449,15 +573,14 @@ function claimWorkspaceMutation(cwd: string, root = workspaceLockKey(cwd)): () =
       let stale = false;
       let observedToken: string | undefined;
       try {
-        const lock = JSON.parse(readRegularFile(lockPath));
+        const lock = JSON.parse(readRegularFile(lockPath)) as Record<string, unknown>;
         observedToken = typeof lock.token === "string" ? lock.token : undefined;
-        stale = lock.pid == null
-          ? Date.now() - statSync(lockPath).mtimeMs > LOCK_STALE_MS
-          : !isProcessAlive(lock.pid);
+        stale = isLockStale(lockPath, lock);
       } catch {
         try { stale = Date.now() - statSync(lockPath).mtimeMs > LOCK_STALE_MS; } catch {}
       }
       if (!stale || !takeOverStaleLock(lockPath, observedToken)) throw new Error("Workspace checkout is busy; use worktree isolation");
+      if (activeHostMutation(cwd)) throw new Error("Pi edit/write is active; retry the workflow after it finishes");
     }
   }
   if (!token) throw new Error("Could not claim workspace mutation lock");
@@ -1260,7 +1383,7 @@ function getAssistantFailure(messages: unknown[]): string | undefined {
  * Returns the assistant's text and real token usage from pi's session stats.
  */
 // Lazy-load pi SDK singletons (created once, reused across all agent calls in a workflow)
-let _sdk: { createAgentSession: any; createCodingTools: any; DefaultResourceLoader: any; AuthStorage: any; ModelRegistry: any; SessionManager: any; SettingsManager: any } | undefined;
+let _sdk: { createAgentSession: any; createCodingTools: any; DefaultResourceLoader: any; AuthStorage: any; ModelRegistry: any; ModelRuntime: any; SessionManager: any; SettingsManager: any } | undefined;
 async function loadSdk() {
   if (!_sdk) {
     // @ts-ignore — runtime import from pi's core SDK
@@ -1269,17 +1392,26 @@ async function loadSdk() {
   return _sdk;
 }
 
-// Auth + registry created once per process
-let _auth: any;
-let _registry: any;
-function getAuthAndRegistry() {
-  if (!_auth) {
-    const sdk = _sdk!;
-    const agentDir = join(process.env.HOME ?? "~", ".pi", "agent");
-    _auth = sdk.AuthStorage.create(join(agentDir, "auth.json"));
-    _registry = sdk.ModelRegistry.create(_auth, join(agentDir, "models.json"));
+// Auth/runtime fallbacks are cached per agent directory for direct SDK callers.
+const _fallbackRuntimes = new Map<string, Promise<{ auth?: any; registry?: any; modelRuntime?: any }>>();
+function getAuthAndRegistry(agentDir: string): Promise<{ auth?: any; registry?: any; modelRuntime?: any }> {
+  let fallback = _fallbackRuntimes.get(agentDir);
+  if (!fallback) {
+    fallback = (async () => {
+      const sdk = _sdk!;
+      if (typeof sdk.ModelRuntime?.create === "function") {
+        return { modelRuntime: await sdk.ModelRuntime.create({
+          authPath: join(agentDir, "auth.json"),
+          modelsPath: join(agentDir, "models.json"),
+        }) };
+      }
+      const auth = sdk.AuthStorage.create(join(agentDir, "auth.json"));
+      const registry = sdk.ModelRegistry.create(auth, join(agentDir, "models.json"));
+      return { auth, registry };
+    })();
+    _fallbackRuntimes.set(agentDir, fallback);
   }
-  return { auth: _auth, registry: _registry };
+  return fallback;
 }
 
 async function runSdkWorker(
@@ -1287,18 +1419,28 @@ async function runSdkWorker(
 ): Promise<WorkerResult> {
   const { prompt } = options;
   const sdk = await loadSdk();
-  const fallback = getAuthAndRegistry();
-  const registry = options.runtime?.modelRegistry ?? fallback.registry;
-  const authStorage = options.runtime?.authStorage ?? registry.authStorage ?? fallback.auth;
+  if (!sdk) throw new Error("Pi SDK failed to load");
+  let modelRuntime = options.runtime?.modelRuntime;
   const agentDir = options.runtime?.agentDir ?? join(process.env.HOME ?? "~", ".pi", "agent");
+  // Do not construct a second auth/model runtime when the parent supplied one.
+  // Direct callers without a runtime get the current SDK's ModelRuntime; legacy
+  // callers can still provide authStorage/modelRegistry explicitly.
+  const hasLegacyRuntime = !!(options.runtime?.modelRegistry || options.runtime?.authStorage);
+  const fallback = modelRuntime || hasLegacyRuntime ? undefined : await getAuthAndRegistry(agentDir);
+  modelRuntime ??= fallback?.modelRuntime;
+  const registry = options.runtime?.modelRegistry ?? fallback?.registry;
+  const authStorage = options.runtime?.authStorage ?? registry?.authStorage ?? fallback?.auth;
 
-  // Resolve model from the parent registry. An explicit unknown model is an error,
-  // never a silent fallback to the user's default model.
+  // Resolve model from the parent's canonical runtime. An explicit unknown model
+  // is an error, never a silent fallback to the user's default model. The legacy
+  // registry path remains only for pre-0.82 hosts and test fakes.
   let model: any | undefined = options.runtime?.defaultModel;
   if (options.model) {
     const slash = options.model.indexOf("/");
     if (slash <= 0) throw new Error(`Model must use provider/id form: ${options.model}`);
-    model = registry.find(options.model.slice(0, slash), options.model.slice(slash + 1));
+    const provider = options.model.slice(0, slash);
+    const modelId = options.model.slice(slash + 1);
+    model = modelRuntime?.getModel?.(provider, modelId) ?? registry?.find?.(provider, modelId);
     if (!model) throw new Error(`Model not found in the active Pi registry: ${options.model}`);
   }
   if (model && options.maxOutputTokens && Number.isFinite(model.maxTokens)) {
@@ -1325,18 +1467,23 @@ async function runSdkWorker(
       });
       await resourceLoader.reload();
     }
-    ({ session } = await sdk.createAgentSession({
+    const sessionOptions: Record<string, unknown> = {
       cwd: options.cwd,
       agentDir,
-      authStorage,
-      modelRegistry: registry,
       sessionManager: sdk.SessionManager.inMemory(),
       settingsManager,
       ...(resourceLoader ? { resourceLoader } : {}),
       customTools: sdk.createCodingTools(options.cwd),
       tools: options.tools ? [...options.tools] : [...SDK_WORKER_TOOLS],
       model,
-    }));
+      ...(options.runtime?.thinkingLevel ? { thinkingLevel: options.runtime.thinkingLevel } : {}),
+    };
+    // Pi 0.82 replaced authStorage/modelRegistry with ModelRuntime. Do not pass
+    // the obsolete keys when a canonical runtime is available: current SDKs ignore
+    // them and silently construct an unrelated runtime.
+    if (modelRuntime) sessionOptions.modelRuntime = modelRuntime;
+    else Object.assign(sessionOptions, { authStorage, modelRegistry: registry });
+    ({ session } = await sdk.createAgentSession(sessionOptions));
   } catch (error) {
     if (options.signal?.aborted) {
       if (session) {
@@ -1556,6 +1703,8 @@ async function executeWorkflowCore(
     phaseReserved: new Map<string, number>(),
     tokenUsage: { input: 0, output: 0, total: 0, cost: 0 },
     activeCanonicalWrites: 0,
+    researchLimiter: createLimiter(MAX_RESEARCH_CONCURRENCY),
+    researchCount: 0,
   };
 
   // Per-phase sub-budgets: phase title -> consumed usage and reservation.
@@ -1986,6 +2135,76 @@ ${JSON.stringify(taskArgs)}
 Results:
 ${JSON.stringify(results).slice(0, 4000)}`, { label: "completeness critic", effect: "read" });
 
+  const researchBackend = options.researchBackend ?? options.runtime?.researchBackend;
+  const research = async (input: unknown): Promise<unknown> => {
+    if (!researchBackend) throw new Error("Research is unavailable: provide an explicit bounded research backend");
+    if (!input || typeof input !== "object" || Array.isArray(input)) throw new TypeError("research() expects a request object");
+    // Do not let a VM-realm object cross into a host-provided backend. This also
+    // rejects functions, cycles, exotic objects, and non-finite values before the
+    // request-size check below.
+    assertBridgeValue(input);
+    const request = cloneFromContext(input) as Record<string, unknown>;
+    const source = request.source;
+    if (source !== "web_search" && source !== "exa" && source !== "context7" && source !== "mcp") {
+      throw new Error("research source must be web_search, exa, context7, or mcp");
+    }
+    if (!researchBackend.sources.includes(source)) throw new Error(`Research backend does not support ${source}`);
+    const query = request.query;
+    if (query !== undefined && (typeof query !== "string" || !query.trim() || Buffer.byteLength(query, "utf8") > 8192)) {
+      throw new Error("research query must be a non-empty string of at most 8192 bytes");
+    }
+    const url = request.url;
+    if (url !== undefined && (typeof url !== "string" || !url.trim() || Buffer.byteLength(url, "utf8") > 8192)) {
+      throw new Error("research url must be a non-empty string of at most 8192 bytes");
+    }
+    const libraryId = request.libraryId;
+    if (libraryId !== undefined && (typeof libraryId !== "string" || Buffer.byteLength(libraryId, "utf8") > 512)) {
+      throw new Error("research libraryId must be a string of at most 512 bytes");
+    }
+    const operation = request.operation;
+    if (operation !== undefined && operation !== "resolve" && operation !== "query") throw new Error("research operation must be resolve or query");
+    const tool = request.tool;
+    if (tool !== undefined && (typeof tool !== "string" || !tool.trim() || Buffer.byteLength(tool, "utf8") > 256)) {
+      throw new Error("research tool must be a non-empty string of at most 256 bytes");
+    }
+    const limit = request.limit === undefined ? undefined : finiteNonNegative(request.limit as number, "research limit");
+    if (limit !== undefined && (!Number.isInteger(limit) || limit < 1 || limit > 20)) throw new Error("research limit must be an integer from 1 to 20");
+    const normalized: ResearchRequest = {
+      source,
+      ...(query !== undefined ? { query } : {}),
+      ...(url !== undefined ? { url } : {}),
+      ...(libraryId !== undefined ? { libraryId } : {}),
+      ...(operation !== undefined ? { operation } : {}),
+      ...(tool !== undefined ? { tool } : {}),
+      ...(request.args !== undefined ? { args: request.args } : {}),
+      ...(limit !== undefined ? { limit } : {}),
+    };
+    const encoded = JSON.stringify(normalized);
+    if (Buffer.byteLength(encoded, "utf8") > MAX_RESEARCH_REQUEST_BYTES) throw new Error("research request is too large");
+    if (shared.researchCount >= MAX_RESEARCH_CALLS) throw new Error(`Research limit exceeded (${MAX_RESEARCH_CALLS})`);
+    shared.researchCount++;
+    return shared.researchLimiter(async () => {
+      const controller = new AbortController();
+      const unlink = linkAbortSignal(options.signal, controller);
+      const timeout = setTimeout(() => controller.abort(), MAX_RESEARCH_TIMEOUT_MS);
+      try {
+        if (options.signal?.aborted) throw new WorkflowControlError("aborted", "Workflow aborted");
+        const value = await researchBackend.run(normalized, controller.signal);
+        const resultJson = JSON.stringify(value);
+        if (resultJson === undefined || Buffer.byteLength(resultJson, "utf8") > MAX_RESEARCH_RESULT_BYTES) throw new Error(`research result exceeds ${MAX_RESEARCH_RESULT_BYTES} bytes`);
+        writeRunEvent(cwd, runId, { type: "research", source, operation, bytes: Buffer.byteLength(resultJson, "utf8") });
+        return value;
+      } catch (error) {
+        if (options.signal?.aborted) throw new WorkflowControlError("aborted", "Workflow aborted");
+        if (controller.signal.aborted) throw new Error("Research request timed out");
+        throw error;
+      } finally {
+        clearTimeout(timeout);
+        unlink();
+      }
+    });
+  };
+
   // ── Execute in VM ──────────────────────────────────────────────────
   // The context has a null prototype and code generation disabled. Host
   // capabilities are wrapped so neither their constructors nor their native
@@ -2069,6 +2288,7 @@ ${JSON.stringify(results).slice(0, 4000)}`, { label: "completeness critic", effe
     __judgePanel: safeCapability(judgePanel),
     __loopUntilDry: safeCapability(loopUntilDry),
     __completenessCheck: safeCapability(completenessCheck),
+    __research: safeCapability(research),
     __log: safeSyncCapability(log),
     __phase: safeSyncCapability(phase),
     __budgetSpent: safeSyncCapability(() => shared.spent),
@@ -2089,7 +2309,7 @@ ${JSON.stringify(results).slice(0, 4000)}`, { label: "completeness critic", effe
   });
   const argsJson = JSON.stringify(options.args ?? null);
   if (Buffer.byteLength(argsJson, "utf8") > MAX_ARGS_BYTES) throw new Error(`Workflow args are too large (maximum ${MAX_ARGS_BYTES} bytes)`);
-  const wrapped = `${DETERMINISM_PRELUDE}\nconst args = JSON.parse(${JSON.stringify(argsJson)});\nconst agent = __agent; const parallel = __parallel; const pipeline = __pipeline; const log = __log; const phase = __phase; const verify = __verify; const judgePanel = __judgePanel; const loopUntilDry = __loopUntilDry; const completenessCheck = __completenessCheck; const budget = Object.freeze({ total: ${tokenBudget == null ? "null" : tokenBudget}, spent: __budgetSpent, remaining: __budgetRemaining });\n(async () => {\n${body}\n})()`;
+  const wrapped = `${DETERMINISM_PRELUDE}\nconst args = JSON.parse(${JSON.stringify(argsJson)});\nconst agent = __agent; const parallel = __parallel; const pipeline = __pipeline; const log = __log; const phase = __phase; const verify = __verify; const judgePanel = __judgePanel; const loopUntilDry = __loopUntilDry; const completenessCheck = __completenessCheck; const research = __research; const budget = Object.freeze({ total: ${tokenBudget == null ? "null" : tokenBudget}, spent: __budgetSpent, remaining: __budgetRemaining });\n(async () => {\n${body}\n})()`;
   let compiled: vm.Script;
   try {
     compiled = new vm.Script(wrapped, { filename: `${meta.name}.js` });
@@ -2143,6 +2363,7 @@ async function executeWorkflow(script: string, options: ExecuteWorkflowOptions =
       const priorMeta = isRegularFile(metaPath) ? JSON.parse(readRegularFile(metaPath)) : undefined;
       const modelIdentity = meta.model ?? (options.runtime?.defaultModel ? `${options.runtime.defaultModel.provider}/${options.runtime.defaultModel.id}` : null);
       const workerBackend = selectWorkerBackend(options.runtime);
+      const researchBackend = options.researchBackend ?? options.runtime?.researchBackend;
       writeRunJson(cwd, runId, "meta.json", {
         schemaVersion: 2,
         name: meta.name,
@@ -2155,20 +2376,24 @@ async function executeWorkflow(script: string, options: ExecuteWorkflowOptions =
           maxAgents: options.maxAgents,
           timeoutMs: options.timeoutMs,
           modelIdentity,
+          thinkingLevel: options.runtime?.thinkingLevel,
           workerBackend: workerBackend.id,
           workerTools: workerBackend.toolIdentity,
           workerContext: workerBackend.contextIdentity,
           workspaceIdentity: options.runtime?.executionEnvelope?.workspaceIdentity ?? workspaceIdentity(cwd),
+          researchBackend: researchBackend?.id,
         }),
         executionPolicy: {
           tokenBudget: options.tokenBudget ?? null,
           maxAgents: options.maxAgents ?? null,
           timeoutMs: options.timeoutMs ?? null,
           modelIdentity,
+          thinkingLevel: options.runtime?.thinkingLevel ?? null,
           workerBackend: workerBackend.id,
           workerTools: workerBackend.toolIdentity,
           workerContext: workerBackend.contextIdentity,
           workspaceIdentity: options.runtime?.executionEnvelope?.workspaceIdentity ?? workspaceIdentity(cwd),
+          researchBackend: researchBackend?.id ?? null,
           origin: options.runtime?.executionEnvelope?.origin,
           parentRunId: options.runtime?.executionEnvelope?.parentRunId,
         },
@@ -2218,10 +2443,12 @@ function workflowFingerprint(script: string, args: unknown, options: {
   maxAgents?: number;
   timeoutMs?: number;
   modelIdentity?: string | null;
+  thinkingLevel?: string | null;
   workerBackend?: string;
   workerTools?: string;
   workerContext?: string;
   workspaceIdentity?: string;
+  researchBackend?: string;
 }): string {
   return createHash("sha256").update(stableSerialize({
     script,
@@ -2230,10 +2457,12 @@ function workflowFingerprint(script: string, args: unknown, options: {
     maxAgents: options.maxAgents ?? null,
     timeoutMs: options.timeoutMs ?? null,
     modelIdentity: options.modelIdentity ?? null,
+    thinkingLevel: options.thinkingLevel ?? null,
     workerBackend: options.workerBackend ?? SDK_WORKER_BACKEND_ID,
     workerTools: options.workerTools ?? SDK_WORKER_BACKEND.toolIdentity,
     workerContext: options.workerContext ?? SDK_WORKER_CONTEXT_IDENTITY,
     workspaceIdentity: options.workspaceIdentity ?? null,
+    researchBackend: options.researchBackend ?? "none",
     tierConfig: TIER_MODELS,
   })).digest("hex");
 }
@@ -2320,9 +2549,10 @@ function createWorkflowTool() {
     promptGuidelines: [
       "Use workflow when the user explicitly asks for a workflow, workflows, fan-out, or multi-agent orchestration.",
       "script must start with: export const meta = { name, description, phases? }",
-      "Globals: agent(prompt, opts), parallel(fns), pipeline(items, ...stages), phase(title, {budget}), log(msg), args, budget, verify(), judgePanel(), loopUntilDry(), completenessCheck()",
+      "Globals: agent(prompt, opts), parallel(fns), pipeline(items, ...stages), research(request), phase(title, {budget}), log(msg), args, budget, verify(), judgePanel(), loopUntilDry(), completenessCheck()",
       "agent() options include effect: \"read\" or \"write\" (write is the conservative default); parallel writes to the canonical checkout require isolation: \"worktree\".",
       "For machine-readable results use output: { schema: <JSON Schema>, maxRetries?: 0..2 }; read-only calls may retry validation, side-effectful writes never retry automatically.",
+      "research({ source: \"web_search\" | \"exa\" | \"context7\" | \"mcp\", query?, url?, libraryId?, operation?, tool?, args?, limit? }) is read-only and bounded; it requires an explicit host research backend.",
       "Scripts have no direct filesystem or shell access. All side effects go through agent() calls.",
       "Date.now(), Math.random(), and new Date() without args are blocked. Explicit dates like new Date(\"2024-01-01\") and Date.UTC() are allowed.",
       "Workflow code is trusted-plan code, not an OS security boundary; use a container or separate process for hostile scripts.",
@@ -2407,6 +2637,8 @@ function createWorkflowTool() {
       const notify = (message: string, level: "info" | "error") => { try { ctx.ui.notify(message, level); } catch {} };
       const shouldResume = params.resume !== false;
       const shouldForceResume = params.forceResume === true;
+      const parentModelRuntime = (ctx as any).modelRuntime ?? (ctx.modelRegistry as any)?.runtime;
+      const researchBackend = (ctx as any).researchBackend as ResearchBackend | undefined;
       const modelIdentity = meta.model ?? (ctx.model ? `${ctx.model.provider}/${ctx.model.id}` : null);
       const runtimeEnvelope: ExecutionEnvelope = {
         origin: { sessionId: ctx.sessionManager.getSessionId() },
@@ -2419,10 +2651,12 @@ function createWorkflowTool() {
         maxAgents,
         timeoutMs,
         modelIdentity,
+        thinkingLevel: (ctx as any).thinkingLevel ?? null,
         workerBackend: SDK_WORKER_BACKEND.id,
         workerTools: SDK_WORKER_BACKEND.toolIdentity,
         workerContext: SDK_WORKER_BACKEND.contextIdentity,
         workspaceIdentity: runtimeEnvelope.workspaceIdentity,
+        researchBackend: researchBackend?.id,
       });
       let runId = params.runId;
       let resumeJournal: Map<number, JournalEntry> | undefined;
@@ -2496,10 +2730,12 @@ function createWorkflowTool() {
           maxAgents: maxAgents ?? null,
           timeoutMs: timeoutMs ?? null,
           modelIdentity,
+          thinkingLevel: (ctx as any).thinkingLevel ?? null,
           workerBackend: SDK_WORKER_BACKEND.id,
           workerTools: SDK_WORKER_BACKEND.toolIdentity,
           workerContext: SDK_WORKER_BACKEND.contextIdentity,
           workspaceIdentity: runtimeEnvelope.workspaceIdentity,
+          researchBackend: researchBackend?.id ?? null,
           origin: runtimeEnvelope.origin,
           parentRunId: runtimeEnvelope.parentRunId,
         },
@@ -2512,9 +2748,12 @@ function createWorkflowTool() {
       }
 
       const runtime: WorkflowRuntime = {
+        modelRuntime: parentModelRuntime,
         modelRegistry: ctx.modelRegistry,
-        authStorage: ctx.modelRegistry?.authStorage,
+        authStorage: (ctx.modelRegistry as any)?.authStorage,
         defaultModel: ctx.model,
+        thinkingLevel: (ctx as any).thinkingLevel,
+        researchBackend,
         agentDir: join(process.env.HOME ?? "~", ".pi", "agent"),
         onUpdate,
         executionEnvelope: runtimeEnvelope,
@@ -2582,8 +2821,8 @@ function getRunStatus(cwd: string, runId: string): Record<string, unknown> | nul
   let orphaned = false;
   if (!hasComplete && !hasError && !hasCancelled && !hasPaused && isRegularFile(lockPath)) {
     try {
-      const lock = JSON.parse(readRegularFile(lockPath));
-      orphaned = !isProcessAlive(lock.pid);
+      const lock = JSON.parse(readRegularFile(lockPath)) as Record<string, unknown>;
+      orphaned = isLockStale(lockPath, lock);
     } catch {
       orphaned = false;
     }
@@ -2853,7 +3092,28 @@ function listWorkflowRuns(cwd: string): WorkflowRunRecord[] {
 
 // ── Extension Entry Point ─────────────────────────────────────────────────
 
+function registerCanonicalMutationGuards(pi: ExtensionAPI): void {
+  pi.on("tool_call", (event, ctx) => {
+    if (event.toolName !== "edit" && event.toolName !== "write") return;
+    const key = workspaceLockKey(ctx.cwd);
+    if (ACTIVE_CANONICAL_WRITES.has(key) || workspaceLockIsActive(ctx.cwd)) {
+      return { block: true, reason: "A workflow is mutating this checkout; retry the Pi edit/write after it finishes." };
+    }
+    let calls = ACTIVE_HOST_MUTATIONS.get(key);
+    if (!calls) ACTIVE_HOST_MUTATIONS.set(key, calls = new Set());
+    calls.add(event.toolCallId);
+  });
+  pi.on("tool_execution_end", event => {
+    for (const [key, calls] of ACTIVE_HOST_MUTATIONS) {
+      calls.delete(event.toolCallId);
+      if (calls.size === 0) ACTIVE_HOST_MUTATIONS.delete(key);
+    }
+  });
+  pi.on("session_shutdown", () => ACTIVE_HOST_MUTATIONS.clear());
+}
+
 export default function registerExtension(pi: ExtensionAPI) {
+  registerCanonicalMutationGuards(pi);
   const tool = createWorkflowTool();
   const statusTool = createWorkflowStatusTool();
   pi.registerTool(tool);
@@ -3059,5 +3319,5 @@ export default function registerExtension(pi: ExtensionAPI) {
 
 // ── Exports ───────────────────────────────────────────────────────────────
 
-export { executeWorkflow, parseScript, createWorkflowTool, createWorkflowStatusTool, enrichSyntaxError, suggestSyntaxFix, validateSyntax, getRunStatus };
-export type { WorkflowMeta, AgentOptions, WorkflowRunResult, JournalEntry };
+export { executeWorkflow, parseScript, createWorkflowTool, createWorkflowStatusTool, enrichSyntaxError, suggestSyntaxFix, validateSyntax, getRunStatus, workspaceIdentity };
+export type { WorkflowMeta, AgentOptions, WorkflowRunResult, JournalEntry, ExecuteWorkflowOptions };

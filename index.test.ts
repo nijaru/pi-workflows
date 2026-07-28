@@ -5,7 +5,7 @@ import { execFileSync } from "node:child_process";
 import { mkdtempSync, mkdirSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { executeWorkflow, getRunStatus, parseScript, enrichSyntaxError, suggestSyntaxFix, validateSyntax } from "./index";
+import { executeWorkflow, getRunStatus, parseScript, enrichSyntaxError, suggestSyntaxFix, validateSyntax, workspaceIdentity } from "./index";
 
 describe("pi-workflows", () => {
   describe("parseScript", () => {
@@ -180,6 +180,61 @@ const value = 1 / Date.now();
         const meta = JSON.parse(readFileSync(join(cwd, ".pi", "workflows", "run-backend", "meta.json"), "utf8"));
         expect(meta.executionPolicy.workerBackend).toBe("test-worker");
         expect(meta.executionPolicy.workspaceIdentity).toMatch(/^path:/);
+      } finally {
+        rmSync(cwd, { recursive: true, force: true });
+      }
+    });
+
+    test("research uses an explicit bounded backend and records the capability", async () => {
+      const cwd = mkdtempSync(join(tmpdir(), "pi-workflows-test-"));
+      const requests: unknown[] = [];
+      try {
+        const researchBackend = {
+          id: "test-research",
+          sources: ["web_search"] as const,
+          run: async (request: unknown) => {
+            requests.push(request);
+            return { answer: "bounded result" };
+          },
+        };
+        const script = `export const meta = { name: "research", description: "test" };\nreturn await research({ source: "web_search", query: "pi workflows", limit: 3 });`;
+        const result = await executeWorkflow(script, { cwd, runId: "run-research", researchBackend, tokenBudget: 20000 });
+        expect(result.result).toEqual({ answer: "bounded result" });
+        expect(requests).toEqual([{ source: "web_search", query: "pi workflows", limit: 3 }]);
+        const runDir = join(cwd, ".pi", "workflows", "run-research");
+        const events = readFileSync(join(runDir, "events.jsonl"), "utf8");
+        expect(events).toContain('"type":"research"');
+        const meta = JSON.parse(readFileSync(join(runDir, "meta.json"), "utf8"));
+        expect(meta.executionPolicy.researchBackend).toBe("test-research");
+      } finally {
+        rmSync(cwd, { recursive: true, force: true });
+      }
+    });
+
+    test("fails closed when a workflow requests unavailable research", async () => {
+      const cwd = mkdtempSync(join(tmpdir(), "pi-workflows-test-"));
+      try {
+        const script = `export const meta = { name: "research-unavailable", description: "test" };\nreturn await research({ source: "context7", query: "pi" });`;
+        await expect(executeWorkflow(script, { cwd, runId: "run-research-unavailable" })).rejects.toThrow("Research is unavailable");
+      } finally {
+        rmSync(cwd, { recursive: true, force: true });
+      }
+    });
+
+    test("workspace identity changes when dirty tracked contents change", () => {
+      const cwd = mkdtempSync(join(tmpdir(), "pi-workflows-test-"));
+      try {
+        execFileSync("git", ["init", "-q"], { cwd });
+        execFileSync("git", ["config", "user.email", "test@example.com"], { cwd });
+        execFileSync("git", ["config", "user.name", "pi-workflows-test"], { cwd });
+        const file = join(cwd, "tracked.txt");
+        writeFileSync(file, "before\n");
+        execFileSync("git", ["add", "tracked.txt"], { cwd });
+        execFileSync("git", ["commit", "-qm", "init"], { cwd });
+        const before = workspaceIdentity(cwd);
+        writeFileSync(file, "after\n");
+        const after = workspaceIdentity(cwd);
+        expect(after).not.toBe(before);
       } finally {
         rmSync(cwd, { recursive: true, force: true });
       }
@@ -460,6 +515,42 @@ const value = 1 / Date.now();
       expect(mod.createWorkflowStatusTool).toBeTypeOf("function");
       expect(mod.getRunStatus).toBeTypeOf("function");
       expect(mod.enrichSyntaxError).toBeTypeOf("function");
+    });
+
+    test("coordinates host mutations with workflow canonical writes", async () => {
+      const cwd = mkdtempSync(join(tmpdir(), "pi-workflows-test-"));
+      const handlers = new Map<string, (event: any, ctx?: any) => any>();
+      try {
+        const mod = await import("./index");
+        const fakePi = {
+          on: (name: string, handler: (event: any, ctx?: any) => any) => handlers.set(name, handler),
+          registerTool: () => {},
+          registerCommand: () => {},
+          getActiveTools: () => [],
+          setActiveTools: () => {},
+        };
+        mod.default(fakePi as any);
+        const ctx = { cwd };
+        expect(handlers.get("tool_call")!({ type: "tool_call", toolName: "edit", toolCallId: "host-edit" }, ctx)).toBeUndefined();
+        const runtime = {
+          workerBackend: {
+            id: "guard-worker",
+            toolIdentity: "write",
+            contextIdentity: "test-context",
+            run: async () => ({ text: "unreachable", tokens: { input: 1, output: 1, total: 2, cost: 0 } }),
+          },
+        } as any;
+        const script = `export const meta = { name: "guard", description: "test" };\nreturn await agent("write");`;
+        await expect(executeWorkflow(script, { cwd, runId: "run-host-guard", runtime })).rejects.toThrow("Pi edit/write is active");
+        handlers.get("tool_execution_end")!({ type: "tool_execution_end", toolCallId: "host-edit" });
+
+        mkdirSync(join(cwd, ".pi", "workflows"), { recursive: true });
+        writeFileSync(join(cwd, ".pi", "workflows", "workspace.lock"), JSON.stringify({ pid: process.pid, token: "live" }));
+        const blocked = handlers.get("tool_call")!({ type: "tool_call", toolName: "write", toolCallId: "host-write" }, ctx);
+        expect(blocked).toMatchObject({ block: true });
+      } finally {
+        rmSync(cwd, { recursive: true, force: true });
+      }
     });
   });
 
