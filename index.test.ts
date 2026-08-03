@@ -1,11 +1,11 @@
 import { describe, test, expect } from "bun:test";
-import { fauxAssistantMessage, fauxProvider } from "@earendil-works/pi-ai/providers/faux";
+import { fauxAssistantMessage, fauxProvider, fauxToolCall } from "@earendil-works/pi-ai/providers/faux";
 import { AuthStorage, ModelRegistry } from "@earendil-works/pi-coding-agent";
 import { execFileSync } from "node:child_process";
 import { mkdtempSync, mkdirSync, readFileSync, rmSync, utimesSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import registerExtension, { executeWorkflow, getRunStatus, parseScript, enrichSyntaxError, suggestSyntaxFix, validateSyntax, workspaceIdentity } from "./index";
+import registerExtension, { createWorkflowTool, executeWorkflow, getRunStatus, parseScript, enrichSyntaxError, suggestSyntaxFix, validateSyntax, workspaceIdentity } from "./index";
 
 describe("pi-workflows", () => {
   describe("parseScript", () => {
@@ -103,6 +103,40 @@ const value = 1 / Date.now();
       }
     });
 
+    test("pause fences agents waiting for concurrency admission", async () => {
+      const cwd = mkdtempSync(join(tmpdir(), "pi-workflows-test-"));
+      let release!: () => void;
+      let markEightStarted!: () => void;
+      const gate = new Promise<void>(resolve => { release = resolve; });
+      const eightStarted = new Promise<void>(resolve => { markEightStarted = resolve; });
+      let started = 0;
+      const runtime = {
+        workerBackend: {
+          id: "pause-queue-worker",
+          toolIdentity: "read",
+          contextIdentity: "test-context",
+          run: async () => {
+            started++;
+            if (started === 8) markEightStarted();
+            if (started <= 8) await gate;
+            return { text: "done", tokens: { input: 1, output: 1, total: 2, cost: 0 }, stopReason: "stop", hadToolActivity: false };
+          },
+        },
+      } as any;
+      const script = `export const meta = { name: "pause-queue", description: "test" };\nawait parallel(Array.from({ length: 9 }, (_, i) => () => agent("task " + i, { effect: "read" })));`;
+      try {
+        const run = executeWorkflow(script, { cwd, runId: "run-pause-queue", runtime });
+        await eightStarted;
+        writeFileSync(join(cwd, ".pi", "workflows", "run-pause-queue", "paused"), "now");
+        release();
+        await expect(run).rejects.toThrow("Workflow paused");
+        expect(started).toBe(8);
+      } finally {
+        release();
+        rmSync(cwd, { recursive: true, force: true });
+      }
+    });
+
     test("status reports terminal markers with precedence", () => {
       const cwd = mkdtempSync(join(tmpdir(), "pi-workflows-test-"));
       try {
@@ -112,6 +146,31 @@ const value = 1 / Date.now();
         writeFileSync(join(runDir, "error.log"), "failed");
         writeFileSync(join(runDir, "complete.log"), "{}");
         expect(getRunStatus(cwd, "run-status")).toMatchObject({ status: "completed" });
+      } finally {
+        rmSync(cwd, { recursive: true, force: true });
+      }
+    });
+
+    test("terminal completion removes a pause marker written during the final agent", async () => {
+      const cwd = mkdtempSync(join(tmpdir(), "pi-workflows-test-"));
+      const runtime = {
+        workerBackend: {
+          id: "terminal-pause-worker",
+          toolIdentity: "read",
+          contextIdentity: "test-context",
+          run: async () => ({ text: "done", tokens: { input: 1, output: 1, total: 2, cost: 0 }, stopReason: "stop", hadToolActivity: false }),
+        },
+        onUpdate: (update: { content?: Array<{ text?: string }> }) => {
+          if (update.content?.[0]?.text?.includes("completed")) {
+            writeFileSync(join(cwd, ".pi", "workflows", "run-terminal-pause", "paused"), "late pause");
+          }
+        },
+      } as any;
+      const script = `export const meta = { name: "terminal-pause", description: "test" };\nreturn await agent("inspect", { effect: "read" });`;
+      try {
+        await executeWorkflow(script, { cwd, runId: "run-terminal-pause", runtime });
+        expect(getRunStatus(cwd, "run-terminal-pause")).toMatchObject({ status: "completed" });
+        expect(() => readFileSync(join(cwd, ".pi", "workflows", "run-terminal-pause", "paused"), "utf8")).toThrow();
       } finally {
         rmSync(cwd, { recursive: true, force: true });
       }
@@ -293,6 +352,37 @@ const value = 1 / Date.now();
       }
     });
 
+    test("pause fences research calls waiting for concurrency admission", async () => {
+      const cwd = mkdtempSync(join(tmpdir(), "pi-workflows-test-"));
+      let release!: () => void;
+      let markFourStarted!: () => void;
+      const gate = new Promise<void>(resolve => { release = resolve; });
+      const fourStarted = new Promise<void>(resolve => { markFourStarted = resolve; });
+      let started = 0;
+      const researchBackend = {
+        id: "pause-research",
+        sources: ["web_search"] as const,
+        run: async () => {
+          started++;
+          if (started === 4) markFourStarted();
+          if (started <= 4) await gate;
+          return { answer: "bounded" };
+        },
+      };
+      const script = `export const meta = { name: "pause-research", description: "test" };\nawait parallel(Array.from({ length: 5 }, () => () => research({ source: "web_search", query: "bounded" })));`;
+      try {
+        const run = executeWorkflow(script, { cwd, runId: "run-pause-research", researchBackend });
+        await fourStarted;
+        writeFileSync(join(cwd, ".pi", "workflows", "run-pause-research", "paused"), "now");
+        release();
+        await expect(run).rejects.toThrow("Workflow paused");
+        expect(started).toBe(4);
+      } finally {
+        release();
+        rmSync(cwd, { recursive: true, force: true });
+      }
+    });
+
     test("fails closed when a workflow requests unavailable research", async () => {
       const cwd = mkdtempSync(join(tmpdir(), "pi-workflows-test-"));
       try {
@@ -442,6 +532,101 @@ const value = 1 / Date.now();
         expect(getRunStatus(cwd, "run-structured")).toMatchObject({ tokenUsage: { total: 4 } });
         expect(prompts).toHaveLength(2);
         expect(prompts[1]).toContain("Previous response failed validation");
+      } finally {
+        rmSync(cwd, { recursive: true, force: true });
+      }
+    });
+
+    test("rejects truncated worker output instead of journaling success", async () => {
+      const cwd = mkdtempSync(join(tmpdir(), "pi-workflows-test-"));
+      try {
+        const runtime = {
+          workerBackend: {
+            id: "truncated-worker",
+            toolIdentity: "read",
+            contextIdentity: "test-context",
+            run: async () => ({ text: "partial", tokens: { input: 2, output: 3, total: 5, cost: 0 }, stopReason: "length", hadToolActivity: false }),
+          },
+        } as any;
+        const script = `export const meta = { name: "truncated", description: "test" };\nreturn await agent("inspect", { effect: "read" });`;
+        await expect(executeWorkflow(script, { cwd, runId: "run-truncated", runtime })).rejects.toThrow("output was truncated");
+        expect(getRunStatus(cwd, "run-truncated")).toMatchObject({ status: "error", tokenUsage: { total: 5 }, progress: { failed: 1 } });
+      } finally {
+        rmSync(cwd, { recursive: true, force: true });
+      }
+    });
+
+    test("rejects an analysis-only write worker without tool activity", async () => {
+      const cwd = mkdtempSync(join(tmpdir(), "pi-workflows-test-"));
+      try {
+        const runtime = {
+          workerBackend: {
+            id: "empty-write-worker",
+            toolIdentity: "write",
+            contextIdentity: "test-context",
+            run: async () => ({ text: "I would make the change", tokens: { input: 2, output: 3, total: 5, cost: 0 }, stopReason: "stop", hadToolActivity: false }),
+          },
+        } as any;
+        const script = `export const meta = { name: "empty-write", description: "test" };\nreturn await agent("implement the change");`;
+        await expect(executeWorkflow(script, { cwd, runId: "run-empty-write", runtime })).rejects.toThrow("completed without tool activity");
+        expect(getRunStatus(cwd, "run-empty-write")).toMatchObject({ status: "error", tokenUsage: { total: 5 }, progress: { failed: 1 } });
+      } finally {
+        rmSync(cwd, { recursive: true, force: true });
+      }
+    });
+
+    test("rejects write workers with failed tool calls", async () => {
+      const cwd = mkdtempSync(join(tmpdir(), "pi-workflows-test-"));
+      try {
+        const runtime = {
+          workerBackend: {
+            id: "failed-tool-worker",
+            toolIdentity: "write",
+            contextIdentity: "test-context",
+            run: async () => ({ text: "I could not finish", tokens: { input: 2, output: 3, total: 5, cost: 0 }, stopReason: "stop", hadToolActivity: true, hadToolError: true }),
+          },
+        } as any;
+        const script = `export const meta = { name: "failed-tool", description: "test" };\nreturn await agent("edit the file");`;
+        await expect(executeWorkflow(script, { cwd, runId: "run-failed-tool", runtime })).rejects.toThrow("failed tool call");
+        expect(getRunStatus(cwd, "run-failed-tool")).toMatchObject({ status: "error", tokenUsage: { total: 5 }, progress: { failed: 1 } });
+      } finally {
+        rmSync(cwd, { recursive: true, force: true });
+      }
+    });
+
+    test("rejects SDK writes after a failed mutation tool", async () => {
+      const cwd = mkdtempSync(join(tmpdir(), "pi-workflows-test-"));
+      try {
+        const faux = fauxProvider({
+          provider: "workflow-failed-tool-test",
+          models: [{ id: "worker", name: "Workflow failed-tool test", maxTokens: 4096 }],
+        });
+        const authStorage = AuthStorage.inMemory();
+        const modelRegistry = ModelRegistry.inMemory(authStorage);
+        modelRegistry.registerProvider("workflow-failed-tool-test", {
+          api: faux.api as any,
+          apiKey: "test-only",
+          baseUrl: "http://localhost:0",
+          streamSimple: faux.provider.streamSimple,
+          models: faux.models.map(model => ({
+            id: model.id,
+            name: model.name,
+            api: faux.api as any,
+            baseUrl: "http://localhost:0",
+            reasoning: model.reasoning,
+            input: model.input,
+            cost: model.cost,
+            contextWindow: model.contextWindow,
+            maxTokens: model.maxTokens,
+          })),
+        });
+        faux.setResponses([
+          fauxAssistantMessage(fauxToolCall("edit", { path: "missing.txt", oldText: "before", newText: "after" })),
+          fauxAssistantMessage("I could not edit the file."),
+        ]);
+        const defaultModel = modelRegistry.find("workflow-failed-tool-test", "worker");
+        const script = `export const meta = { name: "sdk-failed-tool", description: "test" };\nreturn await agent("edit the file", { label: "leaf" });`;
+        await expect(executeWorkflow(script, { cwd, runId: "run-sdk-failed-tool", runtime: { authStorage, modelRegistry, defaultModel }, tokenBudget: 100000 })).rejects.toThrow("failed tool call");
       } finally {
         rmSync(cwd, { recursive: true, force: true });
       }
@@ -703,6 +888,113 @@ const value = 1 / Date.now();
         mod.default(fakePi as any);
         await commands.get("workflows").handler("clean 0", { cwd, ui: { notify: () => {} } });
         expect(readFileSync(join(runDir, "meta.json"), "utf8")).toContain('"live"');
+      } finally {
+        rmSync(cwd, { recursive: true, force: true });
+      }
+    });
+
+    test("automatic resume is session-affine while explicit resume adopts across sessions", async () => {
+      const cwd = mkdtempSync(join(tmpdir(), "pi-workflows-test-"));
+      const script = `export const meta = { name: "session-resume", description: "test" };\nreturn "done";`;
+      const prepare = async (runId: string, sessionId: string, createdAt: number) => {
+        await executeWorkflow(script, { cwd, runId });
+        const runDir = join(cwd, ".pi", "workflows", runId);
+        rmSync(join(runDir, "complete.log"), { force: true });
+        writeFileSync(join(runDir, "paused"), "paused");
+        const metaPath = join(runDir, "meta.json");
+        const meta = JSON.parse(readFileSync(metaPath, "utf8"));
+        meta.createdAt = createdAt;
+        meta.executionPolicy.origin = { sessionId };
+        writeFileSync(metaPath, JSON.stringify(meta));
+      };
+      const context = (sessionId: string) => ({
+        cwd,
+        model: undefined,
+        modelRegistry: undefined,
+        sessionManager: { getSessionId: () => sessionId },
+        ui: { notify: () => {} },
+      });
+      try {
+        await prepare("run-session-a", "session-a", 1);
+        await prepare("run-session-b", "session-b", 2);
+        const tool = createWorkflowTool();
+        const selected = await tool.execute("automatic", { script, background: false }, undefined, undefined, context("session-a") as any);
+        expect((selected as any).details.runId).toBe("run-session-a");
+        expect(getRunStatus(cwd, "run-session-b")).toMatchObject({ status: "paused" });
+
+        const adopted = await tool.execute("explicit", { script, runId: "run-session-b", background: false }, undefined, undefined, context("session-a") as any);
+        expect((adopted as any).details.runId).toBe("run-session-b");
+        expect(getRunStatus(cwd, "run-session-b")).toMatchObject({ status: "completed" });
+      } finally {
+        rmSync(cwd, { recursive: true, force: true });
+      }
+    });
+
+    test("blocking failures expose a usage marker for outer goal accounting", async () => {
+      const cwd = mkdtempSync(join(tmpdir(), "pi-workflows-test-"));
+      try {
+        const tool = createWorkflowTool();
+        const ctx = {
+          cwd,
+          model: undefined,
+          modelRegistry: undefined,
+          sessionManager: { getSessionId: () => "session-test" },
+          ui: { notify: () => {} },
+        } as any;
+        const script = `export const meta = { name: "failure-marker", description: "test" };\nthrow new Error("worker failed");`;
+        await expect(tool.execute("failure", { script, background: false }, undefined, undefined, ctx)).rejects.toThrow("__pi_workflows_usage__:");
+      } finally {
+        rmSync(cwd, { recursive: true, force: true });
+      }
+    });
+
+    test("blocking SDK failures carry the recorded child usage marker", async () => {
+      const cwd = mkdtempSync(join(tmpdir(), "pi-workflows-test-"));
+      try {
+        const faux = fauxProvider({
+          provider: "workflow-failure-usage-test",
+          models: [{ id: "worker", name: "Workflow failure usage test", maxTokens: 4096 }],
+        });
+        const authStorage = AuthStorage.inMemory();
+        const modelRegistry = ModelRegistry.inMemory(authStorage);
+        modelRegistry.registerProvider("workflow-failure-usage-test", {
+          api: faux.api as any,
+          apiKey: "test-only",
+          baseUrl: "http://localhost:0",
+          streamSimple: faux.provider.streamSimple,
+          models: faux.models.map(model => ({
+            id: model.id,
+            name: model.name,
+            api: faux.api as any,
+            baseUrl: "http://localhost:0",
+            reasoning: model.reasoning,
+            input: model.input,
+            cost: model.cost,
+            contextWindow: model.contextWindow,
+            maxTokens: model.maxTokens,
+          })),
+        });
+        faux.setResponses([fauxAssistantMessage("partial", { stopReason: "length" })]);
+        const defaultModel = modelRegistry.find("workflow-failure-usage-test", "worker");
+        const tool = createWorkflowTool();
+        const ctx = {
+          cwd,
+          model: defaultModel,
+          modelRegistry,
+          sessionManager: { getSessionId: () => "session-test" },
+          ui: { notify: () => {} },
+        } as any;
+        const script = `export const meta = { name: "sdk-failure-usage", description: "test" };\nreturn await agent("inspect", { effect: "read" });`;
+        let thrown: unknown;
+        try {
+          await tool.execute("failure-usage", { script, background: false, tokenBudget: 100000 }, undefined, undefined, ctx);
+        } catch (error) {
+          thrown = error;
+        }
+        const message = thrown instanceof Error ? thrown.message : String(thrown);
+        expect(message).toContain("__pi_workflows_usage__:");
+        const encoded = message.split("__pi_workflows_usage__:").at(-1)!;
+        expect(JSON.parse(encoded)).toEqual({ input: expect.any(Number), output: expect.any(Number), total: expect.any(Number), cost: expect.any(Number) });
       } finally {
         rmSync(cwd, { recursive: true, force: true });
       }

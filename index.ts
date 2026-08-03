@@ -136,7 +136,12 @@ interface WorkerResult {
   text: string;
   tokens: { input: number; output: number; total: number; cost: number };
   model?: string;
+  /** Provider termination reason; SDK workers expose Pi's stop-reason contract. */
   stopReason?: string;
+  /** True when the worker emitted or completed at least one tool call. */
+  hadToolActivity?: boolean;
+  /** True when a tool call returned an error. */
+  hadToolError?: boolean;
 }
 
 type TokenUsage = WorkerResult["tokens"];
@@ -207,9 +212,12 @@ interface WorkflowRunRecord {
   status: string;
   fingerprint?: string;
   createdAt?: number;
+  /** Session that created the run; used only for automatic matching. */
+  originSessionId?: string;
 }
 
 const WORKFLOW_CONTROL_PREFIX = "__pi_workflow_control__:";
+const WORKFLOW_USAGE_PREFIX = "__pi_workflows_usage__:";
 
 class WorkflowControlError extends Error {
   constructor(readonly code: "paused" | "aborted" | "cancelled", message: string) {
@@ -1617,6 +1625,23 @@ function getAssistantFailure(messages: unknown[]): string | undefined {
   return undefined;
 }
 
+function inspectWorkerToolActivity(messages: unknown[]): { hadToolActivity: boolean; hadToolError: boolean } {
+  let hadToolActivity = false;
+  let hadToolError = false;
+  for (const message of messages) {
+    const value = message as any;
+    if (value?.role === "toolResult") {
+      hadToolActivity = true;
+      hadToolError ||= value.isError === true;
+      continue;
+    }
+    if (value?.role === "assistant" && Array.isArray(value.content)) {
+      hadToolActivity ||= value.content.some((part: any) => part?.type === "toolCall");
+    }
+  }
+  return { hadToolActivity, hadToolError };
+}
+
 /**
  * Create an isolated agent session and run a prompt.
  * Returns the assistant's text and real token usage from pi's session stats.
@@ -1799,8 +1824,9 @@ async function runSdkWorker(
     const stats = session.getSessionStats();
     const cost = Number.isFinite(stats.cost) ? stats.cost : 0;
     const finalAssistant = [...session.messages].reverse().find((message: any) => message?.role === "assistant") as any;
+    const toolActivity = inspectWorkerToolActivity(session.messages);
     return {
-      text: text || `[${options.label}: no text output]`,
+      text,
       tokens: {
         input: stats.tokens.input,
         output: stats.tokens.output,
@@ -1809,6 +1835,8 @@ async function runSdkWorker(
       },
       model: finalAssistant?.model,
       stopReason: finalAssistant?.stopReason,
+      hadToolActivity: toolActivity.hadToolActivity,
+      hadToolError: toolActivity.hadToolError,
     };
   } catch (error) {
     const tokens = readSessionTokenUsage(session);
@@ -2095,6 +2123,10 @@ async function executeWorkflowCore(
       let callUsage = { input: 0, output: 0, total: 0, cost: 0 };
       const worktreeName = `${runId}-${callIndex}-${randomUUID().slice(0, 8)}`;
       try {
+        // A pause may arrive while this call waits for concurrency admission.
+        // Re-check after the queue boundary so a paused run cannot start a new
+        // worker or acquire mutation state after admission.
+        throwIfPaused();
         throwIfAborted();
         if (effect === "write" && !opts.isolation) {
           if (shared.activeCanonicalWrites > 0 || ACTIVE_CANONICAL_WRITES.has(canonicalWriteKey)) {
@@ -2169,9 +2201,49 @@ async function executeWorkflowCore(
             recordAttempt(attemptId, attempt, "failed", emptyTokenUsage());
             throw error;
           }
+          if (typeof workerResult.text !== "string") {
+            recordAttempt(attemptId, attempt, "failed", tokens);
+            throw new Error(`worker ${label} returned invalid text output`);
+          }
+          if (workerResult.hadToolActivity !== undefined && typeof workerResult.hadToolActivity !== "boolean") {
+            recordAttempt(attemptId, attempt, "failed", tokens);
+            throw new Error(`worker ${label} returned invalid tool-activity metadata`);
+          }
+          if (workerResult.hadToolError !== undefined && typeof workerResult.hadToolError !== "boolean") {
+            recordAttempt(attemptId, attempt, "failed", tokens);
+            throw new Error(`worker ${label} returned invalid tool-error metadata`);
+          }
           if (Buffer.byteLength(workerResult.text, "utf8") > MAX_AGENT_RESULT_BYTES) {
             recordAttempt(attemptId, attempt, "failed", tokens);
             throw new Error(`agent output exceeds ${MAX_AGENT_RESULT_BYTES} bytes`);
+          }
+
+          // Pi distinguishes normal completion from truncation, pending tool
+          // use, errors, and cancellation. Do not journal a partial or
+          // unfinished worker as completed. Legacy custom backends may omit
+          // stopReason, but the built-in SDK backend always supplies it.
+          if (workerResult.stopReason && workerResult.stopReason !== "stop") {
+            const cancelled = workerResult.stopReason === "aborted" || options.signal?.aborted === true;
+            recordAttempt(attemptId, attempt, cancelled ? "cancelled" : "failed", tokens);
+            if (cancelled) throw new WorkflowControlError("aborted", "Workflow aborted");
+            const reason = workerResult.stopReason === "length"
+              ? "output was truncated at the model limit"
+              : workerResult.stopReason === "toolUse"
+                ? "ended while requesting another tool call"
+                : `stopped with ${workerResult.stopReason}`;
+            throw new Error(`Agent "${label}" ${reason}`);
+          }
+          if (effect === "write" && workerResult.hadToolError === true) {
+            recordAttempt(attemptId, attempt, "failed", tokens);
+            throw new Error(`Agent "${label}" had a failed tool call; verify the mutation before continuing`);
+          }
+          if (effect === "write" && workerResult.hadToolActivity === false) {
+            recordAttempt(attemptId, attempt, "failed", tokens);
+            throw new Error(`Agent "${label}" completed without tool activity; use effect: "read" for analysis-only work`);
+          }
+          if (!workerResult.text.trim() && workerResult.hadToolActivity !== true) {
+            recordAttempt(attemptId, attempt, "failed", tokens);
+            throw new Error(`Agent "${label}" returned no text or tool activity`);
           }
 
           if (!structuredOutput) {
@@ -2195,6 +2267,9 @@ async function executeWorkflowCore(
           }
         }
         throwIfAborted();
+        // Let an in-flight worker finish, account its usage, then stop before
+        // publishing the call result or advancing the workflow script.
+        throwIfPaused();
         if (!completed) throw new Error(`Structured output validation failed: ${lastStructuredError}`);
 
         const journalEntry: JournalEntry = {
@@ -2290,6 +2365,7 @@ async function executeWorkflowCore(
 
   const parallel = async (thunks: Array<() => Promise<unknown>>): Promise<unknown[]> => {
     throwIfAborted();
+    throwIfPaused();
     if (!Array.isArray(thunks) || thunks.some(t => typeof t !== "function")) {
       throw new TypeError("parallel() expects an array of functions");
     }
@@ -2298,7 +2374,13 @@ async function executeWorkflowCore(
     }
     // Fail-fast is intentional, but drain siblings before terminalizing so they
     // cannot keep spending, writing journals, or merging worktrees afterward.
-    const settled = await Promise.allSettled(thunks.map(thunk => Promise.resolve().then(() => invokeWorkflowFunction(thunk, []))));
+    const settled = await Promise.allSettled(thunks.map(thunk => Promise.resolve().then(() => {
+      throwIfAborted();
+      throwIfPaused();
+      return invokeWorkflowFunction(thunk, []);
+    })));
+    throwIfAborted();
+    throwIfPaused();
     const failure = settled.find((entry): entry is PromiseRejectedResult => entry.status === "rejected");
     if (failure) throw failure.reason;
     return settled.map(entry => (entry as PromiseFulfilledResult<unknown>).value);
@@ -2311,6 +2393,7 @@ async function executeWorkflowCore(
     ...stages: Array<(prev: unknown, original: unknown, index: number) => unknown>
   ): Promise<unknown[]> => {
     throwIfAborted();
+    throwIfPaused();
     if (!Array.isArray(items)) throw new TypeError("pipeline() expects an array");
     if (items.length > MAX_PARALLEL_ITEMS) throw new Error(`pipeline() accepts at most ${MAX_PARALLEL_ITEMS} items`);
     if (stages.some(stage => typeof stage !== "function")) throw new TypeError("pipeline() stages must be functions");
@@ -2321,9 +2404,12 @@ async function executeWorkflowCore(
         throwIfPaused();
         value = await invokeWorkflowFunction(stage, [value, item, i]);
         throwIfAborted();
+        throwIfPaused();
       }
       return value;
     }));
+    throwIfAborted();
+    throwIfPaused();
     const failure = settled.find((entry): entry is PromiseRejectedResult => entry.status === "rejected");
     if (failure) throw failure.reason;
     return settled.map(entry => (entry as PromiseFulfilledResult<unknown>).value);
@@ -2423,6 +2509,7 @@ ${text}`, {
         if (!seen.has(key)) fresh.push({ item, key });
       }
       throwIfAborted();
+      throwIfPaused();
       if (!fresh.length) { dry++; continue; }
       dry = 0;
       for (const entry of fresh) { seen.add(entry.key); all.push(entry.item); }
@@ -2485,6 +2572,8 @@ ${JSON.stringify(results).slice(0, 4000)}`, { label: "completeness critic", effe
     };
     const encoded = JSON.stringify(normalized);
     if (Buffer.byteLength(encoded, "utf8") > MAX_RESEARCH_REQUEST_BYTES) throw new Error("research request is too large");
+    throwIfAborted();
+    throwIfPaused();
     if (shared.researchCount >= MAX_RESEARCH_CALLS) throw new Error(`Research limit exceeded (${MAX_RESEARCH_CALLS})`);
     shared.researchCount++;
     const controller = new AbortController();
@@ -2510,6 +2599,8 @@ ${JSON.stringify(results).slice(0, 4000)}`, { label: "completeness critic", effe
     });
     operationPromise = shared.researchLimiter(async () => {
       try {
+        throwIfAborted();
+        throwIfPaused();
         if (options.signal?.aborted) throw new WorkflowControlError("aborted", "Workflow aborted");
         if (controller.signal.aborted || Date.now() - startedAt >= researchTimeoutMs) throw new ResearchTimeoutError();
         const remainingMs = Math.max(1, researchTimeoutMs - (Date.now() - startedAt));
@@ -2519,6 +2610,8 @@ ${JSON.stringify(results).slice(0, 4000)}`, { label: "completeness critic", effe
         });
         const value = await Promise.race([backendPromise, backendTimeout]);
         if (controller.signal.aborted || Date.now() - startedAt >= researchTimeoutMs) throw new ResearchTimeoutError();
+        throwIfAborted();
+        throwIfPaused();
         const resultJson = JSON.stringify(value);
         if (resultJson === undefined || Buffer.byteLength(resultJson, "utf8") > MAX_RESEARCH_RESULT_BYTES) throw new Error(`research result exceeds ${MAX_RESEARCH_RESULT_BYTES} bytes`);
         writeRunEvent(cwd, runId, { type: "research", source, operation, bytes: Buffer.byteLength(resultJson, "utf8") });
@@ -2657,6 +2750,10 @@ ${JSON.stringify(results).slice(0, 4000)}`, { label: "completeness critic", effe
   }
   let result: unknown;
   try {
+    // A pause is a workflow boundary as well as an agent boundary. Check once
+    // before entering the VM so a pre-existing pause cannot run a no-agent plan.
+    throwIfAborted();
+    throwIfPaused();
     result = await compiled.runInContext(context, { timeout: timeoutMs });
   } catch (err) {
     // Bun may defer vm.Script parsing until execution. Only actual SyntaxErrors
@@ -2812,10 +2909,13 @@ function clearRunMarkers(cwd: string, runId: string): void {
 }
 
 function markRunComplete(cwd: string, runId: string, result: WorkflowRunResult): void {
+  // Publish the terminal marker before removing pause state. Status gives the
+  // complete marker precedence, so a crash in cleanup cannot expose a run as
+  // active or paused after its result has been durably written.
+  writeRunJson(cwd, runId, "complete.log", result);
   removeRunMarker(cwd, runId, "error.log");
   removeRunMarker(cwd, runId, "cancelled");
   removeRunMarker(cwd, runId, "paused");
-  writeRunJson(cwd, runId, "complete.log", result);
 }
 
 function notifyExecutionUsage(runtime: WorkflowRuntime | undefined, usage: { input: number; output: number; total: number; cost: number }): void {
@@ -2826,22 +2926,45 @@ function notifyExecutionState(runtime: WorkflowRuntime | undefined, runId: strin
   try { runtime?.executionEnvelope?.onState?.({ runId, status }); } catch {}
 }
 
+function appendWorkflowUsage(error: unknown, usage: unknown): Error {
+  let normalized = emptyTokenUsage();
+  try { normalized = validateTokenUsage(usage, "workflow failure usage"); } catch {}
+  const marker = `${WORKFLOW_USAGE_PREFIX}${JSON.stringify(normalized)}`;
+  if (error instanceof Error) {
+    // Always append a fresh marker. Worker/model text is untrusted and may
+    // contain the prefix; pi-goal consumes the last marker only.
+    error.message = `${error.message}\n${marker}`;
+    return error;
+  }
+  return new Error(`${String(error)}\n${marker}`);
+}
+
 function markRunFailure(cwd: string, runId: string, error: unknown): "paused" | "cancelled" | "error" {
   const control = decodeWorkflowControl(error)?.code;
   if (control === "paused") {
+    removeRunMarker(cwd, runId, "complete.log");
+    removeRunMarker(cwd, runId, "error.log");
+    removeRunMarker(cwd, runId, "cancelled");
     writeRunJson(cwd, runId, "paused", new Date().toISOString());
     return "paused";
   }
   if (control === "aborted" || control === "cancelled") {
-    removeRunMarker(cwd, runId, "error.log");
     const cancelled = join(getJournalDir(cwd, runId), "cancelled");
+    // Publish the terminal marker before clearing pause state. This ordering
+    // prevents a cross-process pause command from recreating a stale marker
+    // between cleanup and terminal publication.
     writeTextAtomic(cancelled, new Date().toISOString());
+    removeRunMarker(cwd, runId, "complete.log");
+    removeRunMarker(cwd, runId, "error.log");
+    removeRunMarker(cwd, runId, "paused");
     return "cancelled";
   }
-  removeRunMarker(cwd, runId, "complete.log");
   const errorPath = join(getJournalDir(cwd, runId), "error.log");
   const message = error instanceof Error ? error.message : String(error);
   writeTextAtomic(errorPath, `[${new Date().toISOString()}] ${message.slice(0, 8192)}\n`);
+  removeRunMarker(cwd, runId, "complete.log");
+  removeRunMarker(cwd, runId, "cancelled");
+  removeRunMarker(cwd, runId, "paused");
   return "error";
 }
 
@@ -3018,7 +3141,11 @@ function createWorkflowTool() {
         resumeJournal = readJournal(cwd, runId);
         resuming = true;
       } else if (shouldResume) {
+        const sessionId = runtimeEnvelope.origin?.sessionId;
         const runs = listWorkflowRuns(cwd)
+          // Automatic matching is session-affine. Explicit runId resume below
+          // remains the adoption path for a run created by another session.
+          .filter(r => r.originSessionId === sessionId)
           .filter(r => r.fingerprint === fingerprint && r.status !== "completed" && r.status !== "cancelled" && (shouldForceResume || (r.status !== "error" && r.status !== "orphaned")))
           .sort((a, b) => (b.createdAt ?? 0) - (a.createdAt ?? 0));
         const candidate = runs[0];
@@ -3128,7 +3255,8 @@ function createWorkflowTool() {
       } catch (error) {
         const status = markRunFailure(cwd, runId, error);
         notifyExecutionState(runtime, runId, status);
-        throw error;
+        const usage = getRunStatus(cwd, runId)?.tokenUsage;
+        throw appendWorkflowUsage(error, usage);
       } finally {
         unregisterActiveRun();
         releaseRun(cwd, runId);
@@ -3440,6 +3568,7 @@ function listWorkflowRuns(cwd: string): WorkflowRunRecord[] {
         status: status ?? "running",
         fingerprint: typeof parsed.fingerprint === "string" ? parsed.fingerprint : undefined,
         createdAt: typeof parsed.createdAt === "number" ? parsed.createdAt : undefined,
+        originSessionId: typeof parsed.executionPolicy?.origin?.sessionId === "string" ? parsed.executionPolicy.origin.sessionId : undefined,
       });
     }
   } catch {}
@@ -3665,7 +3794,16 @@ export default function registerExtension(pi: ExtensionAPI) {
         try {
           ensurePrivateDir(getJournalDir(cwd, targetRunId), cwd);
           writeTextAtomic(pauseFile, new Date().toISOString());
-          ctx.ui.notify(`Pause signal sent to ${targetRunId}. The run will stop at the next agent call.`, "info");
+          // Completion/failure can race the marker write. Reconcile the
+          // terminal state immediately so pause never leaves a stale marker
+          // behind when the run finished during this command.
+          const afterPause = getRunStatus(cwd, targetRunId)?.status;
+          if (afterPause === "completed" || afterPause === "error" || afterPause === "cancelled") {
+            removeRunMarker(cwd, targetRunId, "paused");
+            ctx.ui.notify(`Run ${targetRunId} is already ${afterPause}.`, "error");
+          } else {
+            ctx.ui.notify(`Pause signal sent to ${targetRunId}. The run will stop at the next workflow or agent boundary.`, "info");
+          }
         } catch (e) {
           ctx.ui.notify(`Failed to write pause signal: ${e instanceof Error ? e.message : String(e)}`, "error");
         }
