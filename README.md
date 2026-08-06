@@ -1,5 +1,7 @@
 # pi-workflows
 
+> **Maintenance note:** `pi-workflows` is a standalone, provider-neutral orchestration engine for durable, repeatable, parallel workflows. It complements rather than replaces `pi-subagents`; small one-off delegation is usually simpler there, and workflow runs may use substantially more tokens.
+
 Durable, inspectable multi-agent orchestration for Pi. A workflow is a small JavaScript plan that calls Pi agents sequentially, in parallel, or through pipeline stages.
 
 ```bash
