@@ -1,11 +1,35 @@
 import { describe, test, expect } from "bun:test";
 import { fauxAssistantMessage, fauxProvider, fauxToolCall } from "@earendil-works/pi-ai/providers/faux";
-import { AuthStorage, ModelRegistry } from "@earendil-works/pi-coding-agent";
+import { ModelRuntime } from "@earendil-works/pi-coding-agent";
 import { execFileSync } from "node:child_process";
 import { mkdtempSync, mkdirSync, readFileSync, rmSync, utimesSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import registerExtension, { createWorkflowTool, executeWorkflow, getRunStatus, parseScript, enrichSyntaxError, suggestSyntaxFix, validateSyntax, workspaceIdentity } from "./index";
+
+async function createFauxRuntime(providerId: string, faux: any) {
+  const modelRuntime = await ModelRuntime.create({ modelsPath: null });
+  modelRuntime.registerProvider(providerId, {
+    api: faux.api as any,
+    apiKey: "test-only",
+    baseUrl: "http://localhost:0",
+    streamSimple: faux.provider.streamSimple,
+    models: faux.models.map((model: any) => ({
+      id: model.id,
+      name: model.name,
+      api: faux.api as any,
+      baseUrl: "http://localhost:0",
+      reasoning: model.reasoning,
+      input: model.input,
+      cost: model.cost,
+      contextWindow: model.contextWindow,
+      maxTokens: model.maxTokens,
+    })),
+  });
+  const defaultModel = modelRuntime.getModel(providerId, "worker");
+  if (!defaultModel) throw new Error(`Test model not registered: ${providerId}/worker`);
+  return { modelRuntime, defaultModel };
+}
 
 describe("pi-workflows", () => {
   describe("parseScript", () => {
@@ -419,33 +443,13 @@ const value = 1 / Date.now();
           provider: "workflow-test",
           models: [{ id: "worker", name: "Workflow test", maxTokens: 4096 }],
         });
-        const authStorage = AuthStorage.inMemory();
-        const modelRegistry = ModelRegistry.inMemory(authStorage);
-        modelRegistry.registerProvider("workflow-test", {
-          api: faux.api as any,
-          apiKey: "test-only",
-          baseUrl: "http://localhost:0",
-          streamSimple: faux.provider.streamSimple,
-          models: faux.models.map((model) => ({
-            id: model.id,
-            name: model.name,
-            api: faux.api as any,
-            baseUrl: "http://localhost:0",
-            reasoning: model.reasoning,
-            input: model.input,
-            cost: model.cost,
-            contextWindow: model.contextWindow,
-            maxTokens: model.maxTokens,
-          })),
-        });
+        const { modelRuntime, defaultModel } = await createFauxRuntime("workflow-test", faux);
         faux.setResponses([fauxAssistantMessage("default sdk worker response")]);
-        const defaultModel = modelRegistry.find("workflow-test", "worker");
-        expect(defaultModel).toBeDefined();
         const script = `export const meta = { name: "default-sdk", description: "test" };\nreturn await agent("inspect", { label: "leaf", effect: "read" });`;
         const result = await executeWorkflow(script, {
           cwd,
           runId: "run-default-sdk",
-          runtime: { authStorage, modelRegistry, defaultModel },
+          runtime: { modelRuntime, defaultModel },
           tokenBudget: 100000,
         });
         expect(result.result).toBe("default sdk worker response");
@@ -464,25 +468,7 @@ const value = 1 / Date.now();
           provider: "workflow-cancel-test",
           models: [{ id: "worker", name: "Workflow cancellation test", maxTokens: 4096 }],
         });
-        const authStorage = AuthStorage.inMemory();
-        const modelRegistry = ModelRegistry.inMemory(authStorage);
-        modelRegistry.registerProvider("workflow-cancel-test", {
-          api: faux.api as any,
-          apiKey: "test-only",
-          baseUrl: "http://localhost:0",
-          streamSimple: faux.provider.streamSimple,
-          models: faux.models.map((model) => ({
-            id: model.id,
-            name: model.name,
-            api: faux.api as any,
-            baseUrl: "http://localhost:0",
-            reasoning: model.reasoning,
-            input: model.input,
-            cost: model.cost,
-            contextWindow: model.contextWindow,
-            maxTokens: model.maxTokens,
-          })),
-        });
+        const { modelRuntime, defaultModel } = await createFauxRuntime("workflow-cancel-test", faux);
         let markStarted!: () => void;
         const started = new Promise<void>((resolve) => { markStarted = resolve; });
         faux.setResponses([(_context, options) => {
@@ -491,12 +477,11 @@ const value = 1 / Date.now();
             options?.signal?.addEventListener("abort", () => resolve(fauxAssistantMessage("", { stopReason: "aborted" })), { once: true });
           });
         }]);
-        const defaultModel = modelRegistry.find("workflow-cancel-test", "worker");
         const script = `export const meta = { name: "cancel-sdk", description: "test" };\nreturn await agent("wait", { label: "leaf", effect: "read" });`;
         const run = executeWorkflow(script, {
           cwd,
           runId: "run-cancel-sdk",
-          runtime: { authStorage, modelRegistry, defaultModel },
+          runtime: { modelRuntime, defaultModel },
           tokenBudget: 100000,
           signal: controller.signal,
         });
@@ -601,32 +586,13 @@ const value = 1 / Date.now();
           provider: "workflow-failed-tool-test",
           models: [{ id: "worker", name: "Workflow failed-tool test", maxTokens: 4096 }],
         });
-        const authStorage = AuthStorage.inMemory();
-        const modelRegistry = ModelRegistry.inMemory(authStorage);
-        modelRegistry.registerProvider("workflow-failed-tool-test", {
-          api: faux.api as any,
-          apiKey: "test-only",
-          baseUrl: "http://localhost:0",
-          streamSimple: faux.provider.streamSimple,
-          models: faux.models.map(model => ({
-            id: model.id,
-            name: model.name,
-            api: faux.api as any,
-            baseUrl: "http://localhost:0",
-            reasoning: model.reasoning,
-            input: model.input,
-            cost: model.cost,
-            contextWindow: model.contextWindow,
-            maxTokens: model.maxTokens,
-          })),
-        });
+        const { modelRuntime, defaultModel } = await createFauxRuntime("workflow-failed-tool-test", faux);
         faux.setResponses([
           fauxAssistantMessage(fauxToolCall("edit", { path: "missing.txt", oldText: "before", newText: "after" })),
           fauxAssistantMessage("I could not edit the file."),
         ]);
-        const defaultModel = modelRegistry.find("workflow-failed-tool-test", "worker");
         const script = `export const meta = { name: "sdk-failed-tool", description: "test" };\nreturn await agent("edit the file", { label: "leaf" });`;
-        await expect(executeWorkflow(script, { cwd, runId: "run-sdk-failed-tool", runtime: { authStorage, modelRegistry, defaultModel }, tokenBudget: 100000 })).rejects.toThrow("failed tool call");
+        await expect(executeWorkflow(script, { cwd, runId: "run-sdk-failed-tool", runtime: { modelRuntime, defaultModel }, tokenBudget: 100000 })).rejects.toThrow("failed tool call");
       } finally {
         rmSync(cwd, { recursive: true, force: true });
       }
@@ -955,32 +921,13 @@ const value = 1 / Date.now();
           provider: "workflow-failure-usage-test",
           models: [{ id: "worker", name: "Workflow failure usage test", maxTokens: 4096 }],
         });
-        const authStorage = AuthStorage.inMemory();
-        const modelRegistry = ModelRegistry.inMemory(authStorage);
-        modelRegistry.registerProvider("workflow-failure-usage-test", {
-          api: faux.api as any,
-          apiKey: "test-only",
-          baseUrl: "http://localhost:0",
-          streamSimple: faux.provider.streamSimple,
-          models: faux.models.map(model => ({
-            id: model.id,
-            name: model.name,
-            api: faux.api as any,
-            baseUrl: "http://localhost:0",
-            reasoning: model.reasoning,
-            input: model.input,
-            cost: model.cost,
-            contextWindow: model.contextWindow,
-            maxTokens: model.maxTokens,
-          })),
-        });
+        const { modelRuntime, defaultModel } = await createFauxRuntime("workflow-failure-usage-test", faux);
         faux.setResponses([fauxAssistantMessage("partial", { stopReason: "length" })]);
-        const defaultModel = modelRegistry.find("workflow-failure-usage-test", "worker");
         const tool = createWorkflowTool();
         const ctx = {
           cwd,
           model: defaultModel,
-          modelRegistry,
+          modelRuntime,
           sessionManager: { getSessionId: () => "session-test" },
           ui: { notify: () => {} },
         } as any;
