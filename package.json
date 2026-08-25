@@ -7,6 +7,9 @@
     "url": "https://github.com/nijaru/pi-workflows.git"
   },
   "devDependencies": {
+    "@earendil-works/pi-ai": "0.84.3",
+    "@earendil-works/pi-coding-agent": "0.84.3",
+    "@earendil-works/pi-tui": "0.84.3",
     "typescript": "^6.0.3"
   },
   "description": "Script-as-plan orchestration for pi — model writes JS, runtime executes.",
