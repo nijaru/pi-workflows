@@ -1,136 +1,57 @@
 # pi-workflows
 
-Script-as-plan orchestration for pi. Model writes JS, runtime executes in a sandboxed VM.
-
 ## Architecture
 
-- Single extension: `index.ts` (runtime, persistence, worker, and bounded capability boundaries)
-- Journal: `.pi/workflows/<run-id>/journal.jsonl`
-- Three core functions: agent(), parallel(), pipeline()
-- Quality helpers: verify(), judgePanel(), loopUntilDry(), completenessCheck()
-- Model tier routing (small/medium/big) with task-type classifier
-- Worktree isolation with conflict-safe merge-back
-- Phase budgets with per-phase token caps
-- Background by default, blocking with `background: false`
-- `dryRun` parameter for preview without execution (validates syntax)
-- In-session pause/resume via pause marker file
-- `workflow_status` tool for checking background run progress
-- `/workflows clean` command to prune old run directories
-- Syntax errors enriched with line:column context and code snippet
+- `index.ts` is the Pi extension boundary: tools, commands, and session lifecycle.
+- `plan.ts` synchronously compiles restricted JavaScript into a serializable DAG.
+- `scheduler.ts` owns dependencies, concurrency, budgets, control markers, retries, and terminal results.
+- `store.ts` owns durable run/node state, events, outputs, usage, and coordinator leases.
+- `executor.ts` owns the execution port and the current Pi SDK backend. Keep Pi 2 `AgentHarness` integration behind `createHarnessBackend()` until its public API stabilizes.
+- `workspace.ts` owns Git worktrees, commits, serialized cherry-pick merges, and pending-merge recovery.
 
-## Stack
+The workflow store is authoritative for graph state. Pi SDK or AgentHarness sessions are authoritative for provider, transcript, and tool-operation state. Do not copy provider checkpoints into workflow state.
 
-- TypeScript, Bun
-- Pi extension API (`@earendil-works/pi-coding-agent`)
-- Pi TUI (`@earendil-works/pi-tui`)
-- Pi AI types (`@earendil-works/pi-ai`)
-- `@sinclair/typebox` for parameter schemas
+## Plan contract
 
-## Testing
+- Plans start with `export const meta = { name, description }`.
+- Tasks are created synchronously with `agent({ id, prompt, ... })` or `task(...)`; every task needs a stable ID.
+- `parallel([...])` expresses fan-out and `pipeline([[...], [...]])` adds stage dependencies.
+- Dependency outputs are passed as JSON in downstream prompts.
+- Plan code has no filesystem, shell, process, network, or dynamic-code-generation capability.
+- Write tasks are at-least-once effects. Use `isolation: "worktree"` for concurrent writes and make effects idempotent.
+
+## Persistence and control
+
+- Run data lives under `.pi/workflows/<run-id>/` and is disposable runtime state, not source.
+- Resume requires the same plan and execution-policy hash. Running nodes are retried at the workflow boundary until a concrete AgentHarness adapter can reattach operations.
+- Pause and cancellation use durable marker files; explicit resume removes only the pause marker.
+- Coordinator leases prevent duplicate execution and may be taken over when the recorded process is dead.
+- Preserve `pending-merge.json` until a committed worktree merge is reconciled.
+
+## Development
 
 ```bash
+bun install --frozen-lockfile
 bun test
+bun x tsc --noEmit
+git diff --check
 ```
 
-## SDK Usage
+Before completing behavior changes, run the full test and type-check commands and inspect the diff. Keep tests focused on plan validation, scheduler fault paths, persistence, control markers, and backend seams.
 
-Agent execution uses pi's core SDK directly:
+## Boundaries
 
-```typescript
-const sdk = await import("@earendil-works/pi-coding-agent");
-const runtime = await sdk.ModelRuntime.create({
-  authPath: join(agentDir, "auth.json"),
-  modelsPath: join(agentDir, "models.json"),
-});
-const thinkingLevel = "medium";
-
-const { session } = await sdk.createAgentSession({
-  cwd, agentDir,
-  modelRuntime: runtime, // Pi 0.82+ canonical auth/model runtime
-  thinkingLevel, // inherit the parent session's current level
-  sessionManager: sdk.SessionManager.inMemory(),
-  settingsManager: sdk.SettingsManager.create(cwd, agentDir),
-  customTools: sdk.createCodingTools(cwd),
-  model, // resolved via ModelRuntime
-});
-
-await session.prompt(text);
-const text = extractAssistantText(session.messages); // iterate backwards for last assistant msg
-const stats = session.getSessionStats(); // { tokens: { input, output, total }, cost }
-session.dispose();
-```
-
-- The built-in worker reuses the parent Pi 0.82+ `ModelRuntime` and current thinking level. Legacy `authStorage`/`modelRegistry` options are used only on pre-0.82 hosts and test fakes.
-- Modern direct callers get a cached `ModelRuntime`; legacy auth/registry fallback objects are cached once per process for old hosts.
-- `session.prompt()` returns void — extract response from `session.messages`
-- `session.getSessionStats().cost` can be `undefined`/`NaN` for free models — default to `0`
-
-## Sandbox Rules
-
-The VM sandbox exposes only: `agent`, `parallel`, `pipeline`, `research`, `log`, `phase`, `verify`, `judgePanel`, `loopUntilDry`, `completenessCheck`, `args`, `cwd`, `budget`.
-
-**Blocked:**
-- `process` (except via host `process.cwd()`/`process.env`)
-- `console` (use `log()` instead)
-- `Math.random()` — throws
-- `Date.now()` — throws
-- `new Date()` with no args — throws
-- `eval()` — not in scope
-
-**Allowed:**
-- `new Date("2024-01-01")`, `new Date(0)`, `Date.UTC()`, `Date.parse()`
-- All standard JS except the above
-
-## Key Gotchas
-
-- **Abort handling:** Background catch checks `signal?.aborted || error === "Workflow aborted"` — abort is deliberate cancellation, not failure. No `error.log` written, notifies as info.
-- **Cost reporting:** Default `stats.cost` to `0` for free models. Budget is token-based (unaffected).
-- **Resume scanning:** `listWorkflowRuns()` scans by workflow name. Multiple incomplete runs for the same name is unlikely but possible — picks first match. Fingerprints include dirty-file contents, not only Git status text.
-- **Attempt accounting:** `attempts.jsonl` is the durable source for every worker attempt, including failed/cancelled/invalid attempts; resume seeds budgets from it and uses journals only as a legacy fallback.
-- **Worktree recovery:** `pending-merge.json` is written before the worktree commit and updated after commit. Resume reconciles a committed worktree if the process dies before cherry-pick or journaling; cleanup must preserve pending markers.
-- **Research timeout:** the hard timeout starts before research limiter admission, so queued requests cannot begin after their deadline; late non-cooperative backends are observed and ignored.
-- **Canonical mutation coordination:** workflow locks and host `tool_call` guards prevent Pi edit/write races; worktree merges remain serialized and fail closed on dirty/conflicting main checkouts.
-- **Determinism prelude:** `Date` constructor wrapper uses `new _D(...a)`, not `Reflect.construct`.
-- **Synchronous syntax validation:** `execute()` eagerly validates via `validateSyntax()` (uses `new Function()`) before any execution path. Syntax errors throw immediately as the tool result with line context + heuristic suggestions. **Do NOT use `new vm.Script()` for validation** — Bun defers parsing, so it silently accepts broken code; the error surfaces at `runInContext()` time instead.
-- **Bun vm.Script deferred parsing:** `new vm.Script(code)` does NOT parse on Bun (JavaScriptCore). Parsing happens lazily at `runInContext()`. `runInContext` is wrapped in try/catch that enriches deferred parse errors as a fallback.
-- **Error enrichment:** `enrichSyntaxError()` maps V8 line:col back to the script body and appends `suggestSyntaxFix()` hints (unbalanced parens, odd backticks, unmatched braces/brackets).
-- **Prelude quoting:** The prelude is a single-quoted JS string that generates JS code. Nested quotes inside `new Error("...")` must use escaped single quotes (`\'...'`) or the double-quotes close the string early. This caused a latent syntax bug that produced recurring "missing ) after argument list" failures.
+- This is an unreleased breaking redesign; do not add compatibility shims for the removed pre-plan API or legacy journal format.
+- Do not add a mailbox/team protocol, nested workflow runner, cloud scheduler, or wholesale extension loading into child sessions without a new requirement.
+- The Pi SDK backend is the current implementation. The Pi 2 backend is an injected seam, not an installed dependency.
+- A restricted VM is not an OS sandbox. Hostile workflow code requires process or container isolation.
 
 ## Commands
 
-| Command | Description |
-|---------|-------------|
-| `/workflows list` | Show recent runs and saved commands |
-| `/workflows save <name>` | Save last workflow as reusable command |
-| `/workflows pause <runId>` | Pause running workflow (resume by running again) |
-| `/workflows clean [days]` | Remove completed/errored runs older than N days (default: 7) |
-
-## Tool Parameters
-
-| Parameter | Default | Description |
-|-----------|---------|-------------|
-| `script` | required | JS workflow script with `export const meta = { name, description }` |
-| `args` | undefined | JSON value exposed as `args` global |
-| `background` | true | Run in background (false to block) |
-| `tokenBudget` | unlimited | Hard token cap |
-| `maxAgents` | 1000 | Max agent calls |
-| `resume` | true | Resume from last incomplete run of same name |
-| `forceResume` | false | Retry a run that previously errored |
-| `dryRun` | false | Validate and preview without executing |
-
-## workflow_status Tool
-
-Call after a background `workflow()` to check progress:
-
-- Accepts `runId` (from workflow result) or `workflow` (name filter)
-- Returns: status, agent count, token usage, error message, completion result
-- Defaults to most recent run if neither parameter provided
-
-## Key Patterns
-
-- Script-as-plan: model writes JS, runtime executes in VM sandbox
-- Journal resume: SHA-256 call hashing, crash-safe event log
-- Task-type routing: keyword classifier, no deps
-- Worktrees: git isolation for parallel edits with cherry-pick merge
-- Adversarial evaluation: different agents for execution vs review
-- Tier-based model routing: `~/.pi/workflows/model-tiers.json` config
+- `/workflows list` — show saved workflows and recent runs
+- `/workflows save <name>` — save the most recent workflow call
+- `/workflows run <name>` — run a saved workflow
+- `/workflows pause <runId>` — request a durable pause
+- `/workflows cancel <runId>` — request durable cancellation
+- `/workflows resume <runId>` — explicitly resume a paused or orphaned run
+- `/workflows clean [days]` — remove old completed, failed, or cancelled runs

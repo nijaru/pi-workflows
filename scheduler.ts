@@ -1,5 +1,5 @@
 import { createHash } from "node:crypto";
-import { existsSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { existsSync, rmSync } from "node:fs";
 import { join } from "node:path";
 import type { WorkflowPlan, WorkflowNode, JsonValue } from "./plan";
 import { ExecutionError, parseOutput, selectBackend, type ExecutionBackend, type ExecutionContext, type RuntimeContext } from "./executor";
