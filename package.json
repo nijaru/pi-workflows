@@ -1,6 +1,6 @@
 {
   "name": "pi-workflows",
-  "version": "0.1.0",
+  "version": "0.2.0",
   "author": "Nick Naru <nick@nijaru.com>",
   "repository": {
     "type": "git",
@@ -12,9 +12,14 @@
     "@earendil-works/pi-tui": "0.84.3",
     "typescript": "^6.0.3"
   },
-  "description": "Script-as-plan orchestration for pi — model writes JS, runtime executes.",
+  "description": "Durable plan-first workflow orchestration for Pi agents.",
   "files": [
     "index.ts",
+    "plan.ts",
+    "store.ts",
+    "scheduler.ts",
+    "executor.ts",
+    "workspace.ts",
     "README.md",
     "LICENSE"
   ],
