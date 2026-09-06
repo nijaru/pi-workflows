@@ -23,10 +23,11 @@ The workflow store is authoritative for graph state. Pi SDK or AgentHarness sess
 ## Persistence and control
 
 - Run data lives under `.pi/workflows/<run-id>/` and is disposable runtime state, not source.
-- Resume requires the same plan and execution-policy hash. Running nodes are retried at the workflow boundary until a concrete AgentHarness adapter can reattach operations.
+- Resume requires the same plan and execution-policy hash; the policy (budgets, concurrency, timeout, model, backend identity including tool/session fingerprints) is frozen at run creation and reused verbatim.
+- Running nodes are retried at the workflow boundary until a concrete AgentHarness adapter can reattach operations.
 - Pause and cancellation use durable marker files; explicit resume removes only the pause marker.
 - Coordinator leases prevent duplicate execution and may be taken over when the recorded process is dead.
-- Preserve `pending-merge.json` until a committed worktree merge is reconciled.
+- Interrupted worktree merges are reconciled on resume before the scheduler starts: pending merges complete (or are abandoned on conflict, with the worktree preserved), orphaned per-node worktrees are removed, and landed merges are not duplicated (patch-id equality).
 
 ## Development
 

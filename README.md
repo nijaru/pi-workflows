@@ -53,9 +53,9 @@ const summary = agent({
 return summary;
 ```
 
-`agent()` and `task()` are aliases. Every task requires a stable `id`; execution does not begin while the plan is being compiled. `parallel([...])` documents fan-out. `pipeline([[...], [...]])` adds dependencies from earlier stages to later stages. A dependent task receives predecessor outputs as JSON in its prompt.
+`agent()` and `task()` are aliases. Every task requires a stable `id`; execution does not begin while the plan is being compiled. `parallel([...])` documents fan-out. `pipeline([[...], [...]])` adds dependencies from earlier stages to later stages. A dependent task receives predecessor outputs as JSON in its prompt. `meta` accepts `name`, `description`, and an optional default `model` (`provider/id`).
 
-Plans are trusted code running in a restricted VM. They have no direct filesystem, shell, process, network, or dynamic-code-generation access. `Date.now()`, `Math.random()`, and argument-less `new Date()` are rejected. Use OS or container isolation for hostile code.
+Plans are trusted code running in a restricted VM. They have no direct filesystem, shell, process, network, or dynamic-code-generation access. `Date.now()` and `Math.random()` are unavailable (including aliased access — the VM exposes a `Math` without `random` and a `Date` without `now`). Use OS or container isolation for hostile code.
 
 ## Runtime model
 
@@ -85,7 +85,7 @@ The ownership boundary is intentional:
 | Git worktrees and merge recovery | Workspace effect manager |
 | UI and commands | Pi extension entrypoint |
 
-A workflow run is at-least-once around external effects. Write tasks should be idempotent. Concurrent writes to the canonical checkout require `isolation: "worktree"`.
+A workflow run is at-least-once around external effects. Write tasks should be idempotent. Concurrent writes to the canonical checkout require `isolation: "worktree"`. Interrupted worktree merges are reconciled on resume: a pending merge is completed (or abandoned on conflict), orphaned worktrees are removed, and already-landed merges are not duplicated.
 
 ## Commands and tools
 
@@ -108,7 +108,9 @@ Runs are stored under `.pi/workflows/<run-id>/`:
 - `outputs/` — validated node outputs;
 - `lease.json` — coordinator lease.
 
-Resume is explicit and requires the same plan hash. A stale coordinator lease is recoverable; running nodes are retried at the workflow boundary. Pi 2 integration can later attach and drive open harness operations instead of retrying them.
+The `workflow` tool accepts `script`, `args` (JSON values exposed to the plan), `background` (default `true`; `false` blocks until completion), `dryRun` (validate the plan without executing), `resume` (default `false`; opt in to attach to a paused or orphaned run of the same plan), `runId`, `tokenBudget`, `maxAgents` (1–100), and `timeoutMs` (per node, 1–30 min).
+
+Resume is explicit: pass `resume: true` or a `runId`, or use `/workflows resume <run-id>`. Resume requires the same plan and execution policy — the policy is frozen at run creation, so a changed session model or omitted options cannot silently alter a resumed run. A stale coordinator lease is recoverable; running nodes are retried at the workflow boundary. Pi 2 integration can later attach and drive open harness operations instead of retrying them.
 
 ## Development
 

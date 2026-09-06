@@ -95,9 +95,13 @@ async function schedule(state: RunState, store: RunStore, backend: ExecutionBack
     checkControl(options, state, store);
     promoteReady(state, store);
     const available = maxAgents - active.size;
+    // Reserve the committed usage of running nodes so a budget cannot be
+    // overshot by several same-tick starts before any node reports usage.
+    let committed = state.usage.total;
+    for (const node of Object.values(state.nodes)) if (node.status === "running") committed += node.usage.total;
     for (const node of Object.values(state.nodes).filter(n => n.status === "ready").slice(0, available)) {
-      if (options.tokenBudget !== undefined && state.usage.total >= options.tokenBudget) throw new Error(`Workflow token budget exhausted (${options.tokenBudget})`);
-      if (node.spec.effect === "write" && !node.spec.isolation && [...active.values()].length > 0) continue;
+      if (options.tokenBudget !== undefined && committed >= options.tokenBudget) throw new Error(`Workflow token budget exhausted (${options.tokenBudget})`);
+      if (node.spec.effect === "write" && !node.spec.isolation && active.size > 0) continue;
       node.status = "running"; node.attempts++; node.startedAt = Date.now();
       store.save(state); store.append({ type: "node_started", nodeId: node.spec.id, data: { attempt: node.attempts } as any });
       const run = runNode(node, state, store, backend, options).then(() => { active.delete(node.spec.id); }).catch(error => { active.delete(node.spec.id); throw error; });

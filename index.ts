@@ -9,11 +9,11 @@ import type { AgentToolResult, ExtensionAPI, ExtensionContext, Theme } from "@ea
 import { Type } from "@earendil-works/pi-ai";
 import { Text } from "@earendil-works/pi-tui";
 import { randomUUID } from "node:crypto";
-import { existsSync, mkdirSync, readFileSync, readdirSync, rmSync, writeFileSync } from "node:fs";
+import { existsSync, mkdirSync, readFileSync, readdirSync, rmSync, statSync, writeFileSync } from "node:fs";
 import { join, resolve } from "node:path";
 import { compileWorkflow, parseScript, PlanError, type JsonValue, type WorkflowPlan } from "./plan";
 import { executePlan, workflowPlanHash, type RunOptions } from "./scheduler";
-import { RunStore, leaseAlive, validateRunId, type RunState } from "./store";
+import { RunStore, WORKFLOW_ROOT, leaseAlive, validateRunId, type RunState } from "./store";
 import type { ExecutionBackend, RuntimeContext } from "./executor";
 
 export { compileWorkflow, parseScript, PlanError } from "./plan";
@@ -178,7 +178,28 @@ export default function registerExtension(pi: ExtensionAPI): void {
     if (word === "resume") { const runId = rest[0]; if (!runId) throw new Error("Usage: /workflows resume <runId>"); const run = readRun(cwd, runId); if (!run) throw new Error(`Workflow run ${runId} not found`); await workflow.execute("resume", { script: run.script, args: run.args, runId, background: true, resume: true }, ctx.signal, undefined, ctx); ctx.ui.notify(`Resume requested for ${runId}.`, "info"); return; }
     if (word === "save") { const name = rest[0]; if (!name || !/^[A-Za-z0-9_-]+$/.test(name)) throw new Error("Workflow name must contain letters, numbers, _ or -"); const entries = ctx.sessionManager.getEntries(); const call = [...entries].reverse().flatMap((entry: any) => entry.message?.content ?? []).find((part: any) => part.type === "toolCall" && part.name === "workflow"); if (typeof call?.arguments?.script !== "string") throw new Error("No workflow call found to save"); const dir = join(cwd, COMMANDS_DIR); mkdirSync(dir, { recursive: true, mode: 0o700 }); writeFileSync(join(dir, `${name}.js`), call.arguments.script, { mode: 0o600 }); ctx.ui.notify(`Saved workflow as ${name}.`, "info"); return; }
     if (word === "run") { const name = rest[0]; const saved = savedWorkflows(cwd).find(item => item.name === name); if (!saved) throw new Error(`Saved workflow ${name} not found`); await workflow.execute("saved", { script: readFileSync(saved.path, "utf8"), background: true }, ctx.signal, undefined, ctx); return; }
-    if (word === "clean") { const raw = rest[0]; if (raw !== undefined && (!/^\d+$/.test(raw) || Number(raw) > 3650)) throw new Error("days must be an integer from 0 to 3650"); const days = raw === undefined ? 7 : Number(raw); const before = Date.now() - days * 86400000; let count = 0; for (const run of RunStore.list(cwd)) if (run.updatedAt < before && ["completed", "failed", "cancelled"].includes(run.status)) { rmSync(new RunStore(cwd, run.runId).directory, { recursive: true, force: true }); count++; } ctx.ui.notify(`Cleaned ${count} workflow run(s).`, "info"); return; }
+    if (word === "clean") {
+      const raw = rest[0];
+      if (raw !== undefined && (!/^\d+$/.test(raw) || Number(raw) > 3650)) throw new Error("days must be an integer from 0 to 3650");
+      const days = raw === undefined ? 7 : Number(raw);
+      const before = Date.now() - days * 86400000;
+      let count = 0;
+      const root = join(cwd, WORKFLOW_ROOT);
+      for (const name of existsSync(root) ? readdirSync(root) : []) {
+        // Prune both loadable runs and orphaned directories (e.g. from a failed
+        // lease acquisition) so clean is not blind to runs without state.json.
+        const path = join(root, name);
+        const stat = statSync(path);
+        if (!stat.isDirectory() || stat.mtimeMs >= before) continue;
+        const state = readRun(cwd, name);
+        if (!name.startsWith("run-") && !state) continue;
+        if (state && !["completed", "failed", "cancelled"].includes(state.status)) continue;
+        rmSync(path, { recursive: true, force: true });
+        count++;
+      }
+      ctx.ui.notify(`Cleaned ${count} workflow run(s).`, "info");
+      return;
+    }
     ctx.ui.notify("Usage: /workflows [list|save <name>|run <name>|resume <runId>|pause <runId>|cancel <runId>|clean [days]]", "info");
   } });
   pi.on("session_start", () => { const active = pi.getActiveTools(); const needed = [workflow.name, status.name].filter(name => !active.includes(name)); if (needed.length) pi.setActiveTools([...active, ...needed]); });

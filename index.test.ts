@@ -1,6 +1,6 @@
 import { describe, expect, test } from "bun:test";
 import { execFileSync } from "node:child_process";
-import { mkdtempSync, existsSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { closeSync, mkdtempSync, existsSync, openSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { compileWorkflow, parseScript, PlanError } from "./plan";
@@ -219,6 +219,58 @@ describe("execution policy durability", () => {
       const result = await executePlan({ cwd, runId: "run-policy", args: null, plan, planHash: "hash", backend: fakeBackend(), resume: true, tokenBudget: 1_000_000, maxAgents: 8 });
       expect(result.status).toBe("completed");
       expect(new RunStore(cwd, "run-policy").load().policy).toEqual({ tokenBudget: 5, maxAgents: 2, timeoutMs: null, model: null, backend: "fake" });
+    } finally { rmSync(cwd, { recursive: true, force: true }); }
+  });
+});
+
+describe("durable control and budgets", () => {
+  test("cancel marker fails the run durably without running nodes", async () => {
+    const cwd = tempDir();
+    try {
+      const plan = compileWorkflow(base(`return agent({ id: "x", prompt: "x", effect: "read" });`));
+      const store = new RunStore(cwd, "run-cancel");
+      store.create(plan, null, { planHash: "hash" });
+      writeFileSync(join(store.directory, "cancelled"), "cancel", { mode: 0o600 });
+      await expect(executePlan({ cwd, runId: "run-cancel", args: null, plan, planHash: "hash", backend: fakeBackend() })).rejects.toThrow("cancelled");
+      expect(new RunStore(cwd, "run-cancel").load().status).toBe("cancelled");
+    } finally { rmSync(cwd, { recursive: true, force: true }); }
+  });
+
+  test("token budget stops the run before starting more agents", async () => {
+    const cwd = tempDir();
+    try {
+      const plan = compileWorkflow(base(`const a = agent({ id: "a", prompt: "a", effect: "read" });\nconst b = agent({ id: "b", prompt: "b", effect: "read" });\nreturn parallel([a, b]);`));
+      // Each fake node reports total: 3. With maxAgents=1 the first node lands
+      // (3 tokens) and the budget of 2 must block the second before it starts.
+      await expect(executePlan({ cwd, runId: "run-budget", args: null, plan, planHash: "hash", backend: fakeBackend(), tokenBudget: 2, maxAgents: 1 })).rejects.toThrow("token budget exhausted");
+      const state = new RunStore(cwd, "run-budget").load();
+      expect(state.status).toBe("failed");
+      expect(Object.values(state.nodes).filter(node => node.status === "succeeded").length).toBe(1);
+      expect(Object.values(state.nodes).find(node => node.spec.id === "b")!.attempts).toBe(0);
+    } finally { rmSync(cwd, { recursive: true, force: true }); }
+  });
+
+  test("dependency cycles are rejected at compile time", () => {
+    // needs edges come from task references, so a cycle requires forged refs:
+    // pipeline with a self-referencing stage is the realistic shape.
+    expect(() => compileWorkflow(base(`const a = agent({ id: "a", prompt: "a", effect: "read" });\nconst b = agent({ id: "b", prompt: "b", effect: "read", needs: [a] });\npipeline([[b], [a]]);\nreturn b;`))).toThrow("cycle");
+  });
+
+  test("a dead coordinator lease is recoverable, a live one is not", async () => {
+    const cwd = tempDir();
+    try {
+      const plan = compileWorkflow(base(`return agent({ id: "x", prompt: "x", effect: "read" });`));
+      const store = new RunStore(cwd, "run-lease");
+      store.create(plan, null, { planHash: "hash" });
+      // A lease from a dead PID is stale and must not block a new coordinator.
+      writeFileSync(join(store.directory, "lease.json"), JSON.stringify({ pid: 999_999, token: "t", at: Date.now() }), { mode: 0o600 });
+      const result = await executePlan({ cwd, runId: "run-lease", args: null, plan, planHash: "hash", backend: fakeBackend() });
+      expect(result.status).toBe("completed");
+      // A lease held by this live process blocks a second coordinator.
+      const fd = openSync(join(store.directory, "lease.json"), "wx", 0o600);
+      writeFileSync(fd, JSON.stringify({ pid: process.pid, token: "t", at: Date.now() }));
+      closeSync(fd);
+      await expect(executePlan({ cwd, runId: "run-lease", args: null, plan, planHash: "hash", backend: fakeBackend() })).rejects.toThrow("already active");
     } finally { rmSync(cwd, { recursive: true, force: true }); }
   });
 });

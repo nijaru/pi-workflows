@@ -1,5 +1,5 @@
 import { randomUUID } from "node:crypto";
-import { chmodSync, existsSync, mkdirSync, openSync, readFileSync, renameSync, closeSync, unlinkSync, writeFileSync, appendFileSync, readdirSync, rmSync } from "node:fs";
+import { chmodSync, closeSync, existsSync, fsyncSync, mkdirSync, openSync, readFileSync, renameSync, unlinkSync, appendFileSync, readdirSync, rmSync, writeFileSync } from "node:fs";
 import { dirname, join, resolve } from "node:path";
 import type { WorkflowMeta, WorkflowNode, WorkflowPlan, JsonValue } from "./plan";
 
@@ -88,7 +88,13 @@ function ensurePrivateDirectory(path: string): void {
 function atomicWrite(path: string, content: string): void {
   ensurePrivateDirectory(dirname(path));
   const temporary = `${path}.tmp-${process.pid}-${randomUUID()}`;
-  writeFileSync(temporary, content, { mode: 0o600 });
+  // Write + fsync before rename so a power loss cannot leave a truncated
+  // state.json or marker behind; the rename itself is atomic.
+  const fd = openSync(temporary, "w", 0o600);
+  try {
+    writeFileSync(fd, content);
+    fsyncSync(fd);
+  } finally { closeSync(fd); }
   renameSync(temporary, path);
 }
 
