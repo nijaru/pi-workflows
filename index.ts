@@ -33,15 +33,15 @@ function runKey(cwd: string, runId: string): string { return `${resolve(cwd)}\0$
 function ok(text: string, details?: unknown): AgentToolResult<unknown> { return { content: [{ type: "text", text }], details } as AgentToolResult<unknown>; }
 function normalizeScript(script: string): string { const match = script.trim().match(/^```(?:js|javascript|ts|typescript)?\s*\n([\s\S]*?)\n```$/i); return (match?.[1] ?? script).trim(); }
 function parseLimit(value: unknown, name: string, max: number): number | undefined { if (value === undefined) return undefined; if (!Number.isInteger(value) || Number(value) < 1 || Number(value) > max) throw new Error(`${name} must be an integer from 1 to ${max}`); return Number(value); }
-function planPolicy(params: any, ctx: ExtensionContext, backendId: string): Record<string, JsonValue> { return { tokenBudget: params.tokenBudget ?? null, maxAgents: params.maxAgents ?? null, timeoutMs: params.timeoutMs ?? null, model: ctx.model ? `${ctx.model.provider}/${ctx.model.id}` : null, backend: backendId }; }
+function planPolicy(params: any, ctx: ExtensionContext, backend: ExecutionBackend | undefined): Record<string, JsonValue> { return { tokenBudget: params.tokenBudget ?? null, maxAgents: params.maxAgents ?? null, timeoutMs: params.timeoutMs ?? null, model: ctx.model ? `${ctx.model.provider}/${ctx.model.id}` : null, backend: backend?.id ?? "pi-sdk", toolIdentity: backend?.toolIdentity ?? null, contextIdentity: backend?.contextIdentity ?? null }; }
 
 async function executeWorkflow(script: string, options: { cwd?: string; runId?: string; args?: unknown; runtime?: RuntimeContext; tokenBudget?: number; maxAgents?: number; timeoutMs?: number; signal?: AbortSignal; onUpdate?: (message: string) => void; originSessionId?: string } = {}) {
   const cwd = resolve(options.cwd ?? process.cwd());
   const plan = compileWorkflow(script, options.args ?? null, Math.min(options.timeoutMs ?? 30_000, MAX_TIMEOUT_MS));
   const runId = options.runId ?? `run-${randomUUID()}`;
   validateRunId(runId);
-  const backendId = options.runtime?.harnessBackend?.id ?? "pi-sdk";
-  const planHash = workflowPlanHash(plan, planPolicy(options, { model: options.runtime?.defaultModel } as any, backendId), options.args ?? null);
+  const backend = options.runtime?.harnessBackend;
+  const planHash = workflowPlanHash(plan, planPolicy(options, { model: options.runtime?.defaultModel } as any, backend), options.args ?? null);
   return executePlan({ cwd, runId, args: options.args as JsonValue ?? null, plan, planHash, runtime: options.runtime, tokenBudget: options.tokenBudget, maxAgents: options.maxAgents, timeoutMs: options.timeoutMs, signal: options.signal, onUpdate: options.onUpdate, originSessionId: options.originSessionId });
 }
 
@@ -78,7 +78,7 @@ function createWorkflowTool() {
       maxAgents: Type.Optional(Type.Integer({ minimum: 1, maximum: MAX_AGENTS })),
       timeoutMs: Type.Optional(Type.Integer({ minimum: 1, maximum: MAX_TIMEOUT_MS })),
       runId: Type.Optional(Type.String()),
-      resume: Type.Optional(Type.Boolean({ default: true })),
+      resume: Type.Optional(Type.Boolean({ default: false, description: "Attach to a matching paused or orphaned run instead of starting a new one" })),
       dryRun: Type.Optional(Type.Boolean({ default: false })),
     }),
     renderCall(args: any, theme: Theme, context?: any) {
@@ -105,7 +105,7 @@ function createWorkflowTool() {
         agentDir: join(process.env.HOME ?? ".", ".pi", "agent"),
         harnessBackend: (ctx as any).workflowHarnessBackend as ExecutionBackend | undefined,
       };
-      const policy = planPolicy({ tokenBudget: params.tokenBudget, maxAgents, timeoutMs }, ctx, runtime.harnessBackend?.id ?? "pi-sdk");
+      const policy = planPolicy({ tokenBudget: params.tokenBudget, maxAgents, timeoutMs }, ctx, runtime.harnessBackend);
       const planHash = workflowPlanHash(plan, policy, params.args ?? null);
       let runId = params.runId as string | undefined;
       let resuming = false;
@@ -118,8 +118,10 @@ function createWorkflowTool() {
         if (existing.planHash !== planHash) throw new Error("Workflow plan or execution policy changed; refusing to resume");
         if (existing.status === "completed") throw new Error(`Workflow run ${runId} is already completed`);
         resuming = true;
-      } else if (params.resume !== false) {
-        const candidate = RunStore.list(cwd).reverse().find(state => state.meta.name === plan.meta.name && state.planHash === planHash && ["paused", "orphaned", "running"].includes(state.status));
+      } else if (params.resume) {
+        // Opt-in attach: a paused/orphaned run of the same plan is continued
+        // instead of silently starting a fresh one.
+        const candidate = RunStore.list(cwd).reverse().find(state => state.meta.name === plan.meta.name && state.planHash === planHash && ["paused", "orphaned"].includes(state.status));
         if (candidate) { runId = candidate.runId; resuming = true; }
       }
       runId ??= `run-${randomUUID()}`;

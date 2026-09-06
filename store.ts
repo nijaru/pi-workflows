@@ -156,11 +156,6 @@ export class RunStore {
   }
 
   writeOutput(nodeId: string, value: JsonValue): void { atomicWrite(join(this.directory, "outputs", `${safeName(nodeId)}.json`), JSON.stringify(value)); }
-  readOutput(nodeId: string): JsonValue | undefined {
-    const path = join(this.directory, "outputs", `${safeName(nodeId)}.json`);
-    if (!existsSync(path)) return undefined;
-    return JSON.parse(readFileSync(path, "utf8")) as JsonValue;
-  }
 
   writePendingMerge(pending: PendingMerge): void { atomicWrite(join(this.directory, "pending-merge.json"), JSON.stringify(pending)); }
   clearPendingMerge(): void { rmSync(join(this.directory, "pending-merge.json"), { force: true }); }

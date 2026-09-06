@@ -13,7 +13,6 @@ export interface WorkflowMeta {
   name: string;
   description: string;
   model?: string;
-  phases?: Array<{ title: string; model?: string }>;
 }
 
 export interface OutputSpec {
@@ -26,7 +25,6 @@ export interface AgentTaskSpec {
   prompt: string;
   needs: string[];
   label: string;
-  phase?: string;
   model?: string;
   effect: WorkflowEffect;
   isolation?: Isolation;
@@ -43,7 +41,6 @@ export interface WorkflowPlan {
   body: string;
   nodes: WorkflowNode[];
   resultIds: string[];
-  phases: string[];
 }
 
 export class PlanError extends Error {
@@ -92,7 +89,6 @@ interface TaskOptions {
   prompt: string;
   needs?: unknown;
   label?: string;
-  phase?: string;
   model?: string;
   effect?: WorkflowEffect;
   isolation?: Isolation;
@@ -104,7 +100,6 @@ export function compileWorkflow(script: string, args: unknown = null, timeoutMs 
   const { meta, body } = parseScript(normalized);
   if (Buffer.byteLength(JSON.stringify(args ?? null), "utf8") > MAX_ARGS_BYTES) throw new PlanError(`Workflow args exceed ${MAX_ARGS_BYTES} bytes`);
   const nodes = new Map<string, WorkflowNode>();
-  const phases: string[] = [];
   let order = 0;
 
   const task = (options: TaskOptions): TaskRef => {
@@ -126,7 +121,6 @@ export function compileWorkflow(script: string, args: unknown = null, timeoutMs 
       prompt: options.prompt,
       needs,
       label: options.label ?? id,
-      phase: options.phase,
       model: options.model,
       effect,
       isolation: options.isolation,
@@ -162,17 +156,10 @@ export function compileWorkflow(script: string, args: unknown = null, timeoutMs 
 
   const context = vm.createContext(Object.assign(Object.create(null), {
     args: toJson(args ?? null, "args"),
-    budget: Object.freeze({}),
     agent: task,
     task,
     parallel,
     pipeline,
-    phase: (title: unknown) => {
-      if (typeof title !== "string" || !title.trim()) throw new PlanError("phase() requires a title");
-      phases.push(title);
-      return title;
-    },
-    log: (_message: unknown) => undefined,
     globalThis: undefined,
     // Math without `random`: members are non-enumerable, so they are copied by name.
     // This override, not the syntax scan, is the real entropy guard (aliased access included).
@@ -199,7 +186,7 @@ export function compileWorkflow(script: string, args: unknown = null, timeoutMs 
   const resultIds = collectRefs(returned);
   validatePlan(nodes);
   const leafIds = [...nodes.values()].filter(node => ![...nodes.values()].some(other => other.needs.includes(node.id))).map(node => node.id);
-  return { meta, script: normalized, body, nodes: [...nodes.values()].sort((a, b) => a.order - b.order), resultIds: resultIds.length ? resultIds : leafIds, phases: [...new Set([...phases, ...(meta.phases?.map(p => p.title) ?? [])])] };
+  return { meta, script: normalized, body, nodes: [...nodes.values()].sort((a, b) => a.order - b.order), resultIds: resultIds.length ? resultIds : leafIds };
 }
 
 function normalizeRefs(value: unknown, path: string): string[] {
@@ -290,8 +277,8 @@ function validateMeta(value: unknown): WorkflowMeta {
   if (typeof raw.name !== "string" || !raw.name.trim()) throw new Error("meta.name must be non-empty");
   if (typeof raw.description !== "string" || !raw.description.trim()) throw new Error("meta.description must be non-empty");
   if (raw.model !== undefined && typeof raw.model !== "string") throw new Error("meta.model must be a string");
-  if (raw.phases !== undefined && (!Array.isArray(raw.phases) || raw.phases.some((p: any) => !p || typeof p.title !== "string" || !p.title.trim()))) throw new Error("meta.phases must contain titled phases");
-  return { name: raw.name, description: raw.description, ...(raw.model ? { model: raw.model } : {}), ...(raw.phases ? { phases: raw.phases.map((p: any) => ({ title: p.title, ...(p.model ? { model: p.model } : {}) })) } : {}) };
+  if (raw.phases !== undefined) throw new Error("meta.phases is not supported; meta accepts name, description, and model");
+  return { name: raw.name, description: raw.description, ...(raw.model ? { model: raw.model } : {}) };
 }
 
 class LiteralParser {

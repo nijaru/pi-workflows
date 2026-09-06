@@ -34,6 +34,11 @@ function fakeBackend(responses: Record<string, string> = {}): ExecutionBackend {
 
 const base = (body: string) => `export const meta = { name: "test", description: "Test workflow" };\n${body}`;
 
+  test("meta accepts only name, description, and model", () => {
+    expect(() => compileWorkflow(`export const meta = { name: "x", description: "y", phases: [{ title: "one" }] };\nreturn agent({ id: "x", prompt: "x", effect: "read" });`)).toThrow("meta.phases is not supported");
+    expect(() => compileWorkflow(`export const meta = { name: "x", description: "y", model: "p/m" };\nreturn agent({ id: "x", prompt: "x", effect: "read" });`)).not.toThrow();
+  });
+
 describe("workflow plan compiler", () => {
   test("builds a serializable graph without executing agents", () => {
     const plan = compileWorkflow(base(`const one = agent({ id: "one", prompt: "inspect", effect: "read" });\nconst two = agent({ id: "two", prompt: "summarize", needs: [one], effect: "read", output: { schema: { type: "object", required: ["ok"] } } });\nreturn two;`));
@@ -54,7 +59,7 @@ describe("workflow plan compiler", () => {
   });
 
   test("parses literal metadata without evaluating it and blocks nondeterminism", () => {
-    expect(parseScript(`// header\nexport const meta = { name: "x", description: "y", phases: [{ title: "one" }] };\n`).meta.name).toBe("x");
+    expect(parseScript(`// header\nexport const meta = { name: "x", description: "y", model: "p/m" };\n`).meta.name).toBe("x");
     expect(() => parseScript(base("Date.now();"))).toThrow("deterministic");
     expect(() => parseScript(base("Math.random();"))).toThrow("deterministic");
     expect(() => parseScript(base("new Date();"))).toThrow("deterministic");
