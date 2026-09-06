@@ -126,7 +126,6 @@ async function runNode(node: NodeRecord, state: RunState, store: RunStore, backe
     try { result = await handle.promise; }
     finally { if (timeout) clearTimeout(timeout); unlinkNodeSignal(); }
     if (nodeController.signal.aborted && !options.signal.aborted) throw new Error(`agent ${node.spec.id} timed out`);
-    if (node.spec.effect === "write" && !node.spec.isolation && !result.hadToolActivity) throw new Error(`write agent ${node.spec.id} completed without tool activity`);
     const parsed = parseOutput(result, node.spec.output);
     if (parsed.error) {
       const maxRetries = node.spec.output?.maxRetries ?? 0;

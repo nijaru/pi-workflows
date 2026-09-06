@@ -4,8 +4,8 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { compileWorkflow, parseScript, PlanError } from "./plan";
 import { executePlan } from "./scheduler";
-import type { ExecutionBackend, ExecutionHandle, ExecutionResult } from "./executor";
-import { RunStore } from "./store";
+import { parseOutput, type ExecutionBackend, type ExecutionHandle, type ExecutionResult } from "./executor";
+import { RunStore, emptyUsage } from "./store";
 
 function tempDir(): string { return mkdtempSync(join(tmpdir(), "pi-workflows-") ); }
 function fakeBackend(responses: Record<string, string> = {}): ExecutionBackend {
@@ -14,7 +14,7 @@ function fakeBackend(responses: Record<string, string> = {}): ExecutionBackend {
     toolIdentity: "fake",
     contextIdentity: "test",
     start(spec, _prompt, _context): ExecutionHandle {
-      const result: ExecutionResult = { text: responses[spec.id] ?? JSON.stringify({ id: spec.id, ok: true }), usage: { input: 1, output: 2, total: 3, cost: 0 }, hadToolActivity: spec.effect === "write" };
+      const result: ExecutionResult = { text: responses[spec.id] ?? JSON.stringify({ id: spec.id, ok: true }), usage: { input: 1, output: 2, total: 3, cost: 0 } };
       return { id: spec.id, nodeId: spec.id, backendId: "fake", promise: Promise.resolve(result), abort: async () => undefined };
     },
   };
@@ -47,6 +47,29 @@ describe("workflow plan compiler", () => {
     expect(() => parseScript(base("Math.random();"))).toThrow("deterministic");
     expect(() => parseScript(base("new Date();"))).toThrow("deterministic");
     expect(() => parseScript(`const x = true;\nexport const meta = { name: "x", description: "y" };`)).toThrow("start");
+  });
+
+  test("determinism scan separates regex literals from division and VM guards aliased access", () => {
+    // A regex literal containing forbidden text is not a call; it must compile.
+    expect(() => compileWorkflow(base(`const re = /Date.now()/;\nreturn agent({ id: "x", prompt: "x", effect: "read" });`))).not.toThrow();
+    // Division-shaped bypass is caught in live code.
+    expect(() => compileWorkflow(base(`const t = 1 /Date.now()/ 1;\nreturn agent({ id: "x", prompt: "x", effect: "read" });`))).toThrow("deterministic");
+    // Division is not stripped; the call is still caught in live code.
+    expect(() => compileWorkflow(base(`const v = Date.now() / 2;\nreturn agent({ id: "x", prompt: "x", effect: "read" });`))).toThrow("deterministic");
+    // Comment mentions do not reject a plan.
+    expect(() => compileWorkflow(base(`/* a * Date.now() mention */\nreturn agent({ id: "x", prompt: "x", effect: "read" });`))).not.toThrow();
+    // Plain division is fine.
+    expect(() => compileWorkflow(base(`const t = 1 / 2 / 3;\nreturn agent({ id: "x", prompt: "x", effect: "read" });`))).not.toThrow();
+    // Aliased entropy access is blocked at the VM boundary (Math.random is absent), not by the scan.
+    expect(() => compileWorkflow(base(`const r = Math["random"]();\nreturn agent({ id: "x", prompt: "x", effect: "read" });`))).toThrow("not a function");
+    expect(() => compileWorkflow(base(`const { random } = Math; random();\nreturn agent({ id: "x", prompt: "x", effect: "read" });`))).toThrow("not a function");
+  });
+  test("parseOutput unwraps fenced JSON before validating", () => {
+    const spec = { schema: { type: "object", required: ["ok"] } } as any;
+    expect(parseOutput({ text: '```json\n{"ok": true}\n```', usage: emptyUsage() }, spec)).toEqual({ value: { ok: true } });
+    expect(parseOutput({ text: '```\n{"ok": true}\n```', usage: emptyUsage() }, spec)).toEqual({ value: { ok: true } });
+    expect(parseOutput({ text: '{"ok": true}', usage: emptyUsage() }, spec)).toEqual({ value: { ok: true } });
+    expect(parseOutput({ text: '```json\n{"bad": 1}\n```', usage: emptyUsage() }, spec).error).toBe("output: missing required property");
   });
 });
 

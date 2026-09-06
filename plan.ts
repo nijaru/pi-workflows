@@ -174,6 +174,9 @@ export function compileWorkflow(script: string, args: unknown = null, timeoutMs 
     },
     log: (_message: unknown) => undefined,
     globalThis: undefined,
+    // Math without `random`: members are non-enumerable, so they are copied by name.
+    // This override, not the syntax scan, is the real entropy guard (aliased access included).
+    Math: Object.freeze(Object.fromEntries(Object.getOwnPropertyNames(Math).filter(name => name !== "random").map(name => [name, (Math as any)[name]]))),
   }), { codeGeneration: { strings: false, wasm: false } });
   (context as any).globalThis = context;
   Object.defineProperty(context, "Date", { value: class extends Date {
@@ -251,6 +254,9 @@ export function parseScript(script: string): { meta: WorkflowMeta; body: string 
   const bodyStart = script[end + 1] === ";" ? end + 2 : end + 1;
   const body = script.slice(bodyStart);
   if (/\bDate\s*\.\s*now\s*\(|\bMath\s*\.\s*random\s*\(|\bnew\s+Date\s*\(\s*\)/.test(stripLiterals(body))) {
+    // stripLiterals() replaced comment/string/regex text with spaces; matches in
+    // the remainder are live code, so the VM-level guards (Date override, Math
+    // override) below are the deterministic backstop for aliased access.
     throw new PlanError("Workflow scripts must be deterministic: Date.now(), Math.random(), and new Date() are unavailable");
   }
   return { meta, body };
@@ -269,7 +275,13 @@ function findBalancedObject(source: string, start: number): number {
 }
 
 function stripLiterals(source: string): string {
-  return source.replace(/\/\/[^\r\n]*|\/\*[\s\S]*?\*|(['"`])(?:\\.|(?!\1)[^\\])*\1|\/[^/\n]+\/[gimsuy]*/g, match => match.includes("\n") ? match.replace(/[^\n]/g, " ") : " ".repeat(match.length));
+  // Regex literals are recognized only after a token that cannot end an
+  // expression (operator, `(`/`[`, or a keyword like `return`), so division
+  // such as ``a / b / c`` survives while ``= /Date.now()/`` is blanked.
+  return source.replace(/\/\/[^\r\n]*|\/\*[\s\S]*?\*\/|(['"`])(?:\\.|(?!\1)[^\\])*\1|(\b(?:return|typeof|instanceof|in|of|case|delete|void|yield|await|do|else)\s*|[=([{,:;!&|?<>%*+~^-])\s*(\/(?:\\[\s\S]|[^\\/\n])+\/[gimsuy]*)/g, (match, _quote: string, prefix: string, regex: string) => {
+    if (regex) return prefix + " ".repeat(regex.length);
+    return match.includes("\n") ? match.replace(/[^\n]/g, " ") : " ".repeat(match.length);
+  });
 }
 
 function validateMeta(value: unknown): WorkflowMeta {

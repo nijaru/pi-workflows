@@ -19,8 +19,6 @@ export interface ExecutionResult {
   usage: Usage;
   model?: string;
   stopReason?: string;
-  hadToolActivity?: boolean;
-  hadToolError?: boolean;
 }
 
 export interface ExecutionHandle { id: string; nodeId: string; backendId: string; operationId?: string; promise: Promise<ExecutionResult>; abort(): Promise<void>; }
@@ -34,8 +32,6 @@ export interface ExecutionBackend {
 
 export interface RuntimeContext {
   modelRuntime?: any;
-  modelRegistry?: any;
-  authStorage?: any;
   defaultModel?: any;
   agentDir?: string;
   thinkingLevel?: string;
@@ -66,9 +62,16 @@ export function selectBackend(runtime?: RuntimeContext): ExecutionBackend {
 export function parseOutput(result: ExecutionResult, spec: OutputSpec | undefined): { value?: JsonValue; error?: string } {
   if (!spec) return {};
   let value: unknown;
-  try { value = JSON.parse(result.text); } catch { return { error: "agent output is not valid JSON" }; }
+  try { value = JSON.parse(stripJsonFence(result.text)); } catch { return { error: "agent output is not valid JSON" }; }
   const error = validateJsonSchema(value, spec.schema);
   return error ? { error } : { value: value as JsonValue };
+}
+
+/** Models frequently wrap JSON in a ```json fence; unwrap it before parsing. */
+function stripJsonFence(text: string): string {
+  const trimmed = text.trim();
+  const fence = trimmed.match(/^```(?:json)?\s*\n([\s\S]*?)\n?```$/);
+  return fence?.[1]?.trim() ?? trimmed;
 }
 
 export function validateJsonSchema(value: unknown, schema: unknown, path = "output"): string | undefined {
@@ -112,15 +115,12 @@ async function runSdk(spec: AgentTaskSpec, prompt: string, context: ExecutionCon
   const runtime = context.runtime ?? {};
   const agentDir = runtime.agentDir ?? join(process.env.HOME ?? ".", ".pi", "agent");
   let modelRuntime = runtime.modelRuntime;
-  let registry = runtime.modelRegistry;
-  let authStorage = runtime.authStorage;
-  if (!modelRuntime && !registry && typeof sdk.ModelRuntime?.create === "function") modelRuntime = await sdk.ModelRuntime.create({ authPath: join(agentDir, "auth.json"), modelsPath: join(agentDir, "models.json") });
-  if (!modelRuntime && !registry) { authStorage = sdk.AuthStorage.create(join(agentDir, "auth.json")); registry = sdk.ModelRegistry.create(authStorage, join(agentDir, "models.json")); }
+  if (!modelRuntime && typeof sdk.ModelRuntime?.create === "function") modelRuntime = await sdk.ModelRuntime.create({ authPath: join(agentDir, "auth.json"), modelsPath: join(agentDir, "models.json") });
   let model = runtime.defaultModel;
   if (context.model) {
     const slash = context.model.indexOf("/");
     if (slash <= 0) throw new ExecutionError(`model must use provider/id form: ${context.model}`);
-    model = modelRuntime?.getModel?.(context.model.slice(0, slash), context.model.slice(slash + 1)) ?? registry?.find?.(context.model.slice(0, slash), context.model.slice(slash + 1));
+    model = modelRuntime?.getModel?.(context.model.slice(0, slash), context.model.slice(slash + 1));
     if (!model) throw new ExecutionError(`model not found: ${context.model}`);
   }
   if (!model) throw new ExecutionError("no active Pi model is configured");
@@ -142,7 +142,7 @@ async function runSdk(spec: AgentTaskSpec, prompt: string, context: ExecutionCon
       tools: spec.effect === "read" ? READ_TOOLS : WRITE_TOOLS,
       model,
       ...(context.thinkingLevel ? { thinkingLevel: context.thinkingLevel } : {}),
-      ...(modelRuntime ? { modelRuntime } : { authStorage, modelRegistry: registry }),
+      ...(modelRuntime ? { modelRuntime } : {}),
     };
     ({ session } = await sdk.createAgentSession(options));
     const onAbort = () => { void session.abort().catch(() => {}); };
@@ -150,13 +150,11 @@ async function runSdk(spec: AgentTaskSpec, prompt: string, context: ExecutionCon
     try {
       await session.prompt(`Task: ${spec.label}\n\n${prompt}`);
       if (context.signal.aborted) throw new ExecutionError("workflow cancelled", readUsage(session), "cancelled");
-      const failure = lastFailure(session.messages);
-      if (failure) throw new ExecutionError(failure, readUsage(session));
       const text = lastAssistantText(session.messages);
       if (Buffer.byteLength(text, "utf8") > MAX_RESULT_BYTES) throw new ExecutionError(`agent output exceeds ${MAX_RESULT_BYTES} bytes`, readUsage(session));
       const stats = session.getSessionStats();
       const final = [...session.messages].reverse().find((message: any) => message?.role === "assistant");
-      return { text, usage: normalizeUsage(stats), model: final?.model, stopReason: final?.stopReason, hadToolActivity: hasToolActivity(session.messages), hadToolError: hasToolError(session.messages) };
+      return { text, usage: normalizeUsage(stats), model: final?.model, stopReason: final?.stopReason };
     } finally { context.signal.removeEventListener("abort", onAbort); }
   } catch (error) {
     if (context.signal.aborted) throw new ExecutionError("workflow cancelled", session ? readUsage(session) : undefined, "cancelled");
@@ -173,7 +171,4 @@ function normalizeUsage(stats: any): Usage { const t = stats?.tokens ?? {}; retu
 function readUsage(session: any): Usage | undefined { try { return normalizeUsage(session.getSessionStats()); } catch { return undefined; } }
 function number(value: unknown): number { return typeof value === "number" && Number.isFinite(value) && value >= 0 ? value : 0; }
 function lastAssistantText(messages: any[]): string { for (let i = messages.length - 1; i >= 0; i--) { const m = messages[i]; if (m?.role === "assistant" && Array.isArray(m.content)) return m.content.filter((p: any) => p?.type === "text").map((p: any) => p.text ?? "").join(""); } return ""; }
-function lastFailure(messages: any[]): string | undefined { for (let i = messages.length - 1; i >= 0; i--) { const m = messages[i]; if (m?.role === "toolResult" && m.isError) return m.content?.map((p: any) => p.text ?? "").join("") || "tool execution failed"; } return undefined; }
-function hasToolActivity(messages: any[]): boolean { return messages.some(m => m?.role === "assistant" && Array.isArray(m.content) && m.content.some((p: any) => p?.type === "toolCall")); }
-function hasToolError(messages: any[]): boolean { return messages.some(m => m?.role === "toolResult" && m.isError); }
 function linkSignals(parent: AbortSignal, child: AbortController): () => void { const abort = () => child.abort(); if (parent.aborted) child.abort(); else parent.addEventListener("abort", abort, { once: true }); return () => parent.removeEventListener("abort", abort); }
