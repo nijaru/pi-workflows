@@ -112,6 +112,9 @@ function createWorkflowTool() {
       if (runId) {
         const existing = readRun(cwd, runId);
         if (!existing) throw new Error(`Workflow run ${runId} not found`);
+        // Resume verifies against the policy frozen at creation, so a changed
+        // current-session model or omitted options cannot silently alter the run.
+        if (existing.policy !== undefined && JSON.stringify(existing.policy) !== JSON.stringify(policy)) throw new Error("Workflow execution policy changed; refusing to resume");
         if (existing.planHash !== planHash) throw new Error("Workflow plan or execution policy changed; refusing to resume");
         if (existing.status === "completed") throw new Error(`Workflow run ${runId} is already completed`);
         resuming = true;
@@ -123,7 +126,7 @@ function createWorkflowTool() {
       const key = runKey(cwd, runId);
       const controller = new AbortController();
       const removeAbort = linkAbort(signal, controller);
-      const runOptions: RunOptions = { cwd, runId, args: (params.args ?? null) as JsonValue, plan, planHash, runtime, tokenBudget: params.tokenBudget, maxAgents, timeoutMs, signal: controller.signal, resume: resuming, originSessionId: ctx.sessionManager.getSessionId(), onUpdate: message => onUpdate?.(ok(message, { runId })) };
+      const runOptions: RunOptions = { cwd, runId, args: (params.args ?? null) as JsonValue, plan, planHash, policy, runtime, tokenBudget: params.tokenBudget, maxAgents, timeoutMs, signal: controller.signal, resume: resuming, originSessionId: ctx.sessionManager.getSessionId(), onUpdate: message => onUpdate?.(ok(message, { runId })) };
       const promise = executePlan(runOptions).finally(() => { removeAbort(); ACTIVE.delete(key); });
       ACTIVE.set(key, { controller, promise });
       if (params.background !== false) {

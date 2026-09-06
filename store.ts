@@ -1,5 +1,5 @@
 import { randomUUID } from "node:crypto";
-import { chmodSync, existsSync, mkdirSync, openSync, readFileSync, renameSync, closeSync, unlinkSync, writeFileSync, appendFileSync, readdirSync } from "node:fs";
+import { chmodSync, existsSync, mkdirSync, openSync, readFileSync, renameSync, closeSync, unlinkSync, writeFileSync, appendFileSync, readdirSync, rmSync } from "node:fs";
 import { dirname, join, resolve } from "node:path";
 import type { WorkflowMeta, WorkflowNode, WorkflowPlan, JsonValue } from "./plan";
 
@@ -11,6 +11,13 @@ export interface Usage {
   output: number;
   total: number;
   cost: number;
+}
+
+/** Durable record of a worktree merge interrupted by a coordinator crash. */
+export interface PendingMerge {
+  nodeId: string;
+  path: string;
+  commit: string;
 }
 
 export interface NodeRecord {
@@ -34,6 +41,8 @@ export interface RunState {
   script: string;
   args: JsonValue;
   planHash: string;
+  /** Execution policy frozen at creation; resume recomputes the plan hash from it. */
+  policy?: JsonValue;
   createdAt: number;
   updatedAt: number;
   status: RunStatus;
@@ -92,7 +101,7 @@ export class RunStore {
 
   exists(): boolean { return existsSync(join(this.directory, "state.json")); }
 
-  create(plan: WorkflowPlan, args: unknown, options: { planHash: string; originSessionId?: string; backendId?: string }): RunState {
+  create(plan: WorkflowPlan, args: unknown, options: { planHash: string; originSessionId?: string; backendId?: string; policy?: JsonValue }): RunState {
     if (this.exists()) throw new Error(`Workflow run ${this.runId} already exists`);
     const nodes: Record<string, NodeRecord> = Object.create(null);
     for (const spec of plan.nodes) nodes[spec.id] = { spec, status: spec.needs.length ? "pending" : "ready", attempts: 0, usage: emptyUsage() };
@@ -104,6 +113,7 @@ export class RunStore {
       script: plan.script,
       args: args as JsonValue,
       planHash: options.planHash,
+      ...(options.policy !== undefined ? { policy: options.policy } : {}),
       createdAt: now,
       updatedAt: now,
       status: "running",
@@ -150,6 +160,16 @@ export class RunStore {
     const path = join(this.directory, "outputs", `${safeName(nodeId)}.json`);
     if (!existsSync(path)) return undefined;
     return JSON.parse(readFileSync(path, "utf8")) as JsonValue;
+  }
+
+  writePendingMerge(pending: PendingMerge): void { atomicWrite(join(this.directory, "pending-merge.json"), JSON.stringify(pending)); }
+  clearPendingMerge(): void { rmSync(join(this.directory, "pending-merge.json"), { force: true }); }
+  readPendingMerge(): PendingMerge | undefined {
+    const path = join(this.directory, "pending-merge.json");
+    if (!existsSync(path)) return undefined;
+    const value = JSON.parse(readFileSync(path, "utf8")) as PendingMerge;
+    if (typeof value?.nodeId !== "string" || typeof value?.path !== "string" || typeof value?.commit !== "string") throw new Error(`Corrupt pending-merge marker for ${this.runId}`);
+    return value;
   }
 
   static list(cwd: string): RunState[] {

@@ -4,7 +4,7 @@ import { join } from "node:path";
 import type { WorkflowPlan, WorkflowNode, JsonValue } from "./plan";
 import { ExecutionError, parseOutput, selectBackend, type ExecutionBackend, type ExecutionContext, type RuntimeContext } from "./executor";
 import { addUsage, emptyUsage, RunLease, RunStore, type NodeRecord, type RunState, type Usage } from "./store";
-import { prepareWorkspace } from "./workspace";
+import { prepareWorkspace, reconcileRunWorkspaces } from "./workspace";
 
 export interface RunOptions {
   cwd: string;
@@ -12,6 +12,8 @@ export interface RunOptions {
   args: JsonValue;
   plan: WorkflowPlan;
   planHash: string;
+  /** Execution policy frozen at run creation; reused verbatim on resume. */
+  policy?: JsonValue;
   runtime?: RuntimeContext;
   backend?: ExecutionBackend;
   tokenBudget?: number;
@@ -56,11 +58,16 @@ export async function executePlan(options: RunOptions): Promise<RunResult> {
       }
       for (const node of Object.values(state.nodes)) if (node.status === "running") { node.status = "ready"; node.operationId = undefined; }
       store.save(state);
+      await reconcileRunWorkspaces(options.cwd, store, state);
       store.append({ type: "run_resumed" });
     } else {
-      state = store.create(options.plan, options.args, { planHash: options.planHash, originSessionId: options.originSessionId, backendId: backend.id });
+      state = store.create(options.plan, options.args, { planHash: options.planHash, originSessionId: options.originSessionId, backendId: backend.id, ...(options.policy !== undefined ? { policy: options.policy } : {}) });
     }
-    await schedule(state, store, backend, { ...options, signal: controller.signal });
+    // Budget/concurrency/timeout come from the policy frozen at creation, not
+    // from whatever the resuming caller passed this time.
+    const persisted = (state.policy ?? {}) as Partial<RunOptions>;
+    const effective: RunOptions & { signal: AbortSignal } = { ...options, tokenBudget: persisted.tokenBudget ?? options.tokenBudget, maxAgents: persisted.maxAgents ?? options.maxAgents, timeoutMs: persisted.timeoutMs ?? options.timeoutMs, signal: controller.signal };
+    await schedule(state, store, backend, effective);
     state = store.load();
     state.status = "completed";
     state.result = resolveResult(state);

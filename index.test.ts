@@ -1,13 +1,25 @@
 import { describe, expect, test } from "bun:test";
-import { mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { execFileSync } from "node:child_process";
+import { mkdtempSync, existsSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { compileWorkflow, parseScript, PlanError } from "./plan";
 import { executePlan } from "./scheduler";
 import { parseOutput, type ExecutionBackend, type ExecutionHandle, type ExecutionResult } from "./executor";
-import { RunStore, emptyUsage } from "./store";
+import { RunStore, emptyUsage, type JsonValue } from "./store";
 
 function tempDir(): string { return mkdtempSync(join(tmpdir(), "pi-workflows-") ); }
+
+/** Fresh Git repository with one commit, for worktree/merge recovery tests. */
+function gitRepo(): string {
+  const cwd = tempDir();
+  execFileSync("git", ["init", "-q"], { cwd });
+  for (const [key, value] of [["user.email", "t@t"], ["user.name", "t"]]) execFileSync("git", ["config", key, value], { cwd });
+  writeFileSync(join(cwd, "base.txt"), "base\n");
+  execFileSync("git", ["add", "-A"], { cwd });
+  execFileSync("git", ["commit", "-qm", "init"], { cwd });
+  return cwd;
+}
 function fakeBackend(responses: Record<string, string> = {}): ExecutionBackend {
   return {
     id: "fake",
@@ -109,6 +121,99 @@ describe("durable scheduler", () => {
       expect(new RunStore(cwd, "run-pause").load().status).toBe("paused");
       const result = await executePlan({ cwd, runId: "run-pause", args: null, plan, planHash: "hash", resume: true, backend: fakeBackend() });
       expect(result.status).toBe("completed");
+    } finally { rmSync(cwd, { recursive: true, force: true }); }
+  });
+});
+
+describe("worktree and merge recovery", () => {
+  const script = base(`return agent({ id: "w1", prompt: "p", effect: "write", isolation: "worktree" });`);
+
+  /** Worktree committed and dangling at the moment of the simulated crash. */
+  function crashedWorktree(cwd: string, runId: string) {
+    const store = new RunStore(cwd, runId);
+    const state = store.create(compileWorkflow(script), null, { planHash: "hash" });
+    const path = join(cwd, ".pi", "worktrees", `${runId}-w1`);
+    execFileSync("git", ["worktree", "add", "--detach", path], { cwd, stdio: "ignore" });
+    writeFileSync(join(path, "change.txt"), "from worktree\n");
+    execFileSync("git", ["add", "-A"], { cwd: path });
+    execFileSync("git", ["commit", "-qm", "workflow w1"], { cwd: path, stdio: "ignore" });
+    const commit = execFileSync("git", ["rev-parse", "HEAD"], { cwd: path, encoding: "utf8" }).trim();
+    const node = state.nodes["w1"]!;
+    node.status = "running";
+    node.worktreePath = path;
+    store.save(state);
+    return { store, path, commit };
+  }
+
+  test("resume completes a merge interrupted after the marker was written", async () => {
+    const cwd = gitRepo();
+    try {
+      const plan = compileWorkflow(script);
+      const { store, path, commit } = crashedWorktree(cwd, "run-merge-marker");
+      store.writePendingMerge({ nodeId: "w1", path, commit });
+      const result = await executePlan({ cwd, runId: "run-merge-marker", args: null, plan, planHash: "hash", backend: fakeBackend(), resume: true });
+      expect(result.status).toBe("completed");
+      expect(existsSync(join(store.directory, "pending-merge.json"))).toBe(false);
+      expect(existsSync(path)).toBe(false);
+      const log = execFileSync("git", ["log", "--format=%s"], { cwd, encoding: "utf8" }).trim().split("\n");
+      expect(log).toContain("workflow w1");
+    } finally { rmSync(cwd, { recursive: true, force: true }); }
+  });
+
+  test("resume removes an orphaned worktree and reruns the node", async () => {
+    const cwd = gitRepo();
+    try {
+      const plan = compileWorkflow(script);
+      const { path } = crashedWorktree(cwd, "run-orphan");
+      const result = await executePlan({ cwd, runId: "run-orphan", args: null, plan, planHash: "hash", backend: fakeBackend(), resume: true });
+      expect(result.status).toBe("completed");
+      expect(existsSync(path)).toBe(false);
+    } finally { rmSync(cwd, { recursive: true, force: true }); }
+  });
+
+  test("resume does not duplicate a merge that already landed", async () => {
+    const cwd = gitRepo();
+    try {
+      const plan = compileWorkflow(script);
+      const { store, path, commit } = crashedWorktree(cwd, "run-merge-done");
+      execFileSync("git", ["cherry-pick", commit], { cwd, stdio: "ignore" });
+      store.writePendingMerge({ nodeId: "w1", path, commit });
+      const result = await executePlan({ cwd, runId: "run-merge-done", args: null, plan, planHash: "hash", backend: fakeBackend(), resume: true });
+      expect(result.status).toBe("completed");
+      const count = execFileSync("git", ["rev-list", "--count", "HEAD"], { cwd, encoding: "utf8" }).trim();
+      expect(count).toBe("2"); // init + the single picked change; re-run wrote nothing
+      expect(existsSync(join(store.directory, "pending-merge.json"))).toBe(false);
+      expect(existsSync(path)).toBe(false);
+    } finally { rmSync(cwd, { recursive: true, force: true }); }
+  });
+
+  test("resume refutes a corrupted pending-merge marker without losing state", async () => {
+    const cwd = gitRepo();
+    try {
+      const plan = compileWorkflow(script);
+      const { store, path } = crashedWorktree(cwd, "run-merge-bad");
+      writeFileSync(join(store.directory, "pending-merge.json"), "not json", { mode: 0o600 });
+      const result = await executePlan({ cwd, runId: "run-merge-bad", args: null, plan, planHash: "hash", backend: fakeBackend(), resume: true });
+      expect(result.status).toBe("completed");
+      expect(existsSync(path)).toBe(false);
+    } finally { rmSync(cwd, { recursive: true, force: true }); }
+  });
+});
+
+describe("execution policy durability", () => {
+  test("resume reuses the policy frozen at creation, not the resuming call options", async () => {
+    const cwd = gitRepo();
+    try {
+      const plan = compileWorkflow(base(`return agent({ id: "x", prompt: "x", effect: "read" });`));
+      const store = new RunStore(cwd, "run-policy");
+      const state = store.create(plan, null, { planHash: "hash", policy: { tokenBudget: 5, maxAgents: 2, timeoutMs: null, model: null, backend: "fake" } as any });
+      state.nodes["x"]!.status = "running"; // crash with a node in flight
+      store.save(state);
+      // Resume passes different limits; the persisted policy must win and the
+      // token budget (5) must gate the retry path.
+      const result = await executePlan({ cwd, runId: "run-policy", args: null, plan, planHash: "hash", backend: fakeBackend(), resume: true, tokenBudget: 1_000_000, maxAgents: 8 });
+      expect(result.status).toBe("completed");
+      expect(new RunStore(cwd, "run-policy").load().policy).toEqual({ tokenBudget: 5, maxAgents: 2, timeoutMs: null, model: null, backend: "fake" });
     } finally { rmSync(cwd, { recursive: true, force: true }); }
   });
 });
