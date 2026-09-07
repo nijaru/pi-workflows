@@ -96,7 +96,8 @@ export function validateJsonSchema(value: unknown, schema: unknown, path = "outp
   return undefined;
 }
 
-const sdkBackend: ExecutionBackend = {
+/** The default SDK backend: one fresh Pi session per node. */
+export const sdkBackend: ExecutionBackend = {
   id: "pi-sdk",
   toolIdentity: `read:${READ_TOOLS.join(",")};write:${WRITE_TOOLS.join(",")}`,
   contextIdentity: "fresh-session-no-extensions",
