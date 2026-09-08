@@ -277,7 +277,9 @@ function validateMeta(value: unknown): WorkflowMeta {
   if (typeof raw.name !== "string" || !raw.name.trim()) throw new Error("meta.name must be non-empty");
   if (typeof raw.description !== "string" || !raw.description.trim()) throw new Error("meta.description must be non-empty");
   if (raw.model !== undefined && typeof raw.model !== "string") throw new Error("meta.model must be a string");
-  if (raw.phases !== undefined) throw new Error("meta.phases is not supported; meta accepts name, description, and model");
+  for (const key of Object.keys(raw)) {
+    if (!["name", "description", "model"].includes(key)) throw new Error(`meta.${key} is not supported; meta accepts name, description, and model`);
+  }
   return { name: raw.name, description: raw.description, ...(raw.model ? { model: raw.model } : {}) };
 }
 

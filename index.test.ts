@@ -36,6 +36,7 @@ const base = (body: string) => `export const meta = { name: "test", description:
 
   test("meta accepts only name, description, and model", () => {
     expect(() => compileWorkflow(`export const meta = { name: "x", description: "y", phases: [{ title: "one" }] };\nreturn agent({ id: "x", prompt: "x", effect: "read" });`)).toThrow("meta.phases is not supported");
+    expect(() => compileWorkflow(`export const meta = { name: "x", description: "y", descripton: "typo" };\nreturn agent({ id: "x", prompt: "x", effect: "read" });`)).toThrow("meta.descripton is not supported");
     expect(() => compileWorkflow(`export const meta = { name: "x", description: "y", model: "p/m" };\nreturn agent({ id: "x", prompt: "x", effect: "read" });`)).not.toThrow();
   });
 

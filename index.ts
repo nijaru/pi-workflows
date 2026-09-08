@@ -198,7 +198,8 @@ export default function registerExtension(pi: ExtensionAPI): void {
         // Prune both loadable runs and orphaned directories (e.g. from a failed
         // lease acquisition) so clean is not blind to runs without state.json.
         const path = join(root, name);
-        const stat = statSync(path);
+        let stat;
+        try { stat = statSync(path); } catch { continue; }
         if (!stat.isDirectory() || stat.mtimeMs >= before) continue;
         const state = readRun(cwd, name);
         if (!name.startsWith("run-") && !state) continue;

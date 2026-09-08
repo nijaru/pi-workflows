@@ -77,7 +77,7 @@ export async function reconcileRunWorkspaces(cwd: string, store: RunStore, state
       if (!node.worktreePath || !existsSync(node.worktreePath)) continue;
       if (node.status !== "running" && node.status !== "ready") continue;
       if (gitStatus(node.worktreePath)) throw new Error(`Orphaned workflow worktree ${node.worktreePath} has uncommitted changes; inspect it before resuming`);
-      execFileSync("git", ["worktree", "remove", node.worktreePath, "--force"], { cwd: root, stdio: "ignore" });
+      removeWorktree(root, node.worktreePath);
     }
     // 3. Worktrees left behind after their merge already succeeded.
     for (const entry of readdirWorktrees(root)) {
