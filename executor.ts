@@ -40,7 +40,7 @@ export interface RuntimeContext {
 }
 
 const READ_TOOLS = ["read", "grep", "find", "ls"];
-const WRITE_TOOLS = ["bash", "read", "write", "edit"];
+const WRITE_TOOLS = ["bash", "read", "write", "edit", "grep", "find", "ls"];
 const MAX_RESULT_BYTES = 128 * 1024;
 
 export interface HarnessBackendAdapter {

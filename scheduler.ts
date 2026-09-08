@@ -95,10 +95,10 @@ async function schedule(state: RunState, store: RunStore, backend: ExecutionBack
     checkControl(options, state, store);
     promoteReady(state, store);
     const available = maxAgents - active.size;
-    // Reserve the committed usage of running nodes so a budget cannot be
-    // overshot by several same-tick starts before any node reports usage.
-    let committed = state.usage.total;
-    for (const node of Object.values(state.nodes)) if (node.status === "running") committed += node.usage.total;
+    // Best-effort budget gate on landed usage. Running nodes have not reported
+    // usage yet, so parallel starts in the same tick can overshoot; keep
+    // maxAgents small when a strict budget matters.
+    const committed = state.usage.total;
     for (const node of Object.values(state.nodes).filter(n => n.status === "ready").slice(0, available)) {
       if (options.tokenBudget !== undefined && committed >= options.tokenBudget) throw new Error(`Workflow token budget exhausted (${options.tokenBudget})`);
       if (node.spec.effect === "write" && !node.spec.isolation && active.size > 0) continue;

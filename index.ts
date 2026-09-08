@@ -25,6 +25,8 @@ export type { ExecutionBackend, ExecutionContext, ExecutionHandle, ExecutionResu
 
 const MAX_AGENTS = 100;
 const MAX_TIMEOUT_MS = 30 * 60 * 1000;
+// Plan compilation must stay fast regardless of the per-node execution timeout.
+const COMPILE_TIMEOUT_MS = 10_000;
 const COMMANDS_DIR = ".pi/workflows/commands";
 const ACTIVE = new Map<string, { controller: AbortController; promise: Promise<unknown> }>();
 
@@ -37,12 +39,13 @@ function planPolicy(params: any, ctx: ExtensionContext, backend: ExecutionBacken
 
 async function executeWorkflow(script: string, options: { cwd?: string; runId?: string; args?: unknown; runtime?: RuntimeContext; tokenBudget?: number; maxAgents?: number; timeoutMs?: number; signal?: AbortSignal; onUpdate?: (message: string) => void; originSessionId?: string } = {}) {
   const cwd = resolve(options.cwd ?? process.cwd());
-  const plan = compileWorkflow(script, options.args ?? null, Math.min(options.timeoutMs ?? 30_000, MAX_TIMEOUT_MS));
+  const plan = compileWorkflow(script, options.args ?? null, COMPILE_TIMEOUT_MS);
   const runId = options.runId ?? `run-${randomUUID()}`;
   validateRunId(runId);
   const backend = options.runtime?.harnessBackend;
-  const planHash = workflowPlanHash(plan, planPolicy(options, { model: options.runtime?.defaultModel } as any, backend), options.args ?? null);
-  return executePlan({ cwd, runId, args: options.args as JsonValue ?? null, plan, planHash, runtime: options.runtime, tokenBudget: options.tokenBudget, maxAgents: options.maxAgents, timeoutMs: options.timeoutMs, signal: options.signal, onUpdate: options.onUpdate, originSessionId: options.originSessionId });
+  const policy = planPolicy(options, { model: options.runtime?.defaultModel } as any, backend);
+  const planHash = workflowPlanHash(plan, policy, options.args ?? null);
+  return executePlan({ cwd, runId, args: options.args as JsonValue ?? null, plan, planHash, policy: policy as JsonValue, runtime: options.runtime, tokenBudget: options.tokenBudget, maxAgents: options.maxAgents, timeoutMs: options.timeoutMs, signal: options.signal, onUpdate: options.onUpdate, originSessionId: options.originSessionId });
 }
 
 function readRun(cwd: string, runId: string): RunState | undefined { try { return new RunStore(cwd, runId).load(); } catch { return undefined; } }
@@ -95,7 +98,7 @@ function createWorkflowTool() {
       const script = normalizeScript(params.script);
       const maxAgents = parseLimit(params.maxAgents, "maxAgents", MAX_AGENTS);
       const timeoutMs = parseLimit(params.timeoutMs, "timeoutMs", MAX_TIMEOUT_MS);
-      const plan = compileWorkflow(script, params.args ?? null, Math.min(timeoutMs ?? 30_000, MAX_TIMEOUT_MS));
+      const plan = compileWorkflow(script, params.args ?? null, COMPILE_TIMEOUT_MS);
       if (params.dryRun) return ok(`Plan "${plan.meta.name}" is valid: ${plan.nodes.length} agent(s), ${plan.resultIds.length} result(s).`, { plan });
       const cwd = cwdOf(ctx);
       const runtime: RuntimeContext = {
@@ -120,8 +123,13 @@ function createWorkflowTool() {
         resuming = true;
       } else if (params.resume) {
         // Opt-in attach: a paused/orphaned run of the same plan is continued
-        // instead of silently starting a fresh one.
-        const candidate = RunStore.list(cwd).reverse().find(state => state.meta.name === plan.meta.name && state.planHash === planHash && ["paused", "orphaned"].includes(state.status));
+        // instead of silently starting a fresh one. Orphaned runs are stored
+        // as "running" with a dead lease, so detect them via lease liveness.
+        const candidate = RunStore.list(cwd).reverse().find(state => {
+          if (state.meta.name !== plan.meta.name || state.planHash !== planHash) return false;
+          if (state.status === "paused" || (state.status as string) === "orphaned") return true;
+          return state.status === "running" && !leaseAlive(join(cwd, WORKFLOW_ROOT, state.runId, "lease.json"));
+        });
         if (candidate) { runId = candidate.runId; resuming = true; }
       }
       runId ??= `run-${randomUUID()}`;
@@ -172,7 +180,7 @@ export default function registerExtension(pi: ExtensionAPI): void {
   pi.registerTool(status);
   pi.registerCommand("workflows", { description: "Manage durable workflow plans and runs", handler: async (raw, ctx) => {
     const command = (raw ?? "").trim(); const [word, ...rest] = command.split(/\s+/); const cwd = cwdOf(ctx);
-    if (!word || word === "list") { const runs = RunStore.list(cwd); ctx.ui.notify(["Saved workflows:", ...savedWorkflows(cwd).map(item => `  ${item.name}`), "", "Recent runs:", ...runs.slice(-10).map(run => `  ${run.meta.name} [${run.status}] (${run.runId})`)].join("\n"), "info"); return; }
+    if (!word || word === "list") { const runs = RunStore.list(cwd); const describe = (run: RunState) => run.status === "running" && !leaseAlive(join(cwd, WORKFLOW_ROOT, run.runId, "lease.json")) ? "orphaned" : run.status; ctx.ui.notify(["Saved workflows:", ...savedWorkflows(cwd).map(item => `  ${item.name}`), "", "Recent runs:", ...runs.slice(-10).map(run => `  ${run.meta.name} [${describe(run)}] (${run.runId})`)].join("\n"), "info"); return; }
     if (word === "pause") { const runId = rest[0]; if (!runId) throw new Error("Usage: /workflows pause <runId>"); validateRunId(runId); const run = readRun(cwd, runId); if (!run) throw new Error(`Workflow run ${runId} not found`); mkdirSync(new RunStore(cwd, runId).directory, { recursive: true, mode: 0o700 }); writeFileSync(join(new RunStore(cwd, runId).directory, "paused"), new Date().toISOString(), { mode: 0o600 }); ctx.ui.notify(`Pause requested for ${runId}.`, "info"); return; }
     if (word === "cancel") { const runId = rest[0]; if (!runId) throw new Error("Usage: /workflows cancel <runId>"); validateRunId(runId); const run = readRun(cwd, runId); if (!run) throw new Error(`Workflow run ${runId} not found`); const store = new RunStore(cwd, runId); mkdirSync(store.directory, { recursive: true, mode: 0o700 }); writeFileSync(join(store.directory, "cancelled"), new Date().toISOString(), { mode: 0o600 }); ACTIVE.get(runKey(cwd, runId))?.controller.abort(); ctx.ui.notify(`Cancellation requested for ${runId}.`, "info"); return; }
     if (word === "resume") { const runId = rest[0]; if (!runId) throw new Error("Usage: /workflows resume <runId>"); const run = readRun(cwd, runId); if (!run) throw new Error(`Workflow run ${runId} not found`); await workflow.execute("resume", { script: run.script, args: run.args, runId, background: true, resume: true }, ctx.signal, undefined, ctx); ctx.ui.notify(`Resume requested for ${runId}.`, "info"); return; }
