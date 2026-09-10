@@ -1,5 +1,7 @@
 # pi-workflows
 
+> **Archived and no longer maintained.** A separate workflow engine did not earn its place in daily use; Pi's native execution and delegation (plus `pi-subagents`) cover the need. The code stays available for reference, including the plan compiler and worktree-effect ideas.
+
 Durable, explicit workflow orchestration for Pi. A workflow script **builds a plan first**; Pi then executes that plan through bounded agent lanes.
 
 ```bash
